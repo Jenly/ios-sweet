@@ -576,7 +576,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  #if defined(SWEET)
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
-@@ -118,11 +135,21 @@
+@@ -50,6 +67,7 @@
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <machine/atomic.h>	/* DMB_ISH */
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -118,11 +136,22 @@
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
  
@@ -595,10 +603,11 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	void present(const uint8_t *rec);
 +	bool mdssVerify(uint32_t srcPhys, uint32_t srcStride, uint32_t dstPhys,
 +	    int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w);
++	void free(void) APPLE_KEXT_OVERRIDE;
  };
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -186,6 +213,24 @@
+@@ -186,6 +215,24 @@
  		OSSafeReleaseNULL(fWorkLoop);
  		return false;
  	}
@@ -623,7 +632,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
  	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
  		IOLog("SWEET FB: no vsync timer\n");
-@@ -391,14 +436,117 @@
+@@ -391,14 +438,143 @@
  			src = 0;
  		}
  		if (src != 0 && bpe == 4) {
@@ -698,6 +707,17 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 + * Always restores the reference row before returning, so this cannot leave the
 + * panel showing test pixels.
 + */
++void
++AppleCLCD::free(void)
++{
++	if (fMdssRef != NULL) {
++		IOFree(fMdssRef, fMdssRefLen);
++		fMdssRef = NULL;
++		fMdssRefLen = 0;
++	}
++	IOService::free();
++}
++
 +bool
 +AppleCLCD::mdssVerify(uint32_t srcPhys, uint32_t srcStride, uint32_t dstPhys,
 +    int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w)
@@ -721,14 +741,29 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			break;
 +		}
 +		tried++;
-+		/* Reference back, engine writes the row, compare. */
++		/*
++		 * Reference back, engine writes the row, compare.
++		 *
++		 * The panel is mapped write-combined, so ordering is not optional:
++		 * the CPU's stores must be visible before the engine runs, and the
++		 * engine's must have drained before the CPU reads back, or the
++		 * comparison can pass on stale bytes or fail on a race. wait_idle()
++		 * only proves the flush was consumed -- not that the writeback
++		 * reached memory -- hence the barrier and the settle delay.
++		 */
 +		memcpy((void *)dstRow, fMdssRef, rowBytes);
++		__builtin_arm_dmb(DMB_ISH);
++
 +		if (sweet_mdss_blit(srcPhys, srcStride, dstPhys, fRowBytes,
 +		    (uint32_t)w, 1, (uint32_t)sx, (uint32_t)sy,
 +		    (uint32_t)dx, (uint32_t)dy) != 0) {
 +			break;
 +		}
 +		(void)sweet_mdss_wait_idle(0);
++		__builtin_arm_dmb(DMB_ISH);
++		IOSleep(2);
++		__builtin_arm_dmb(DMB_ISH);
++
 +		if (memcmp((const void *)dstRow, fMdssRef, rowBytes) == 0) {
 +			IOLog("SWEET FB: MDP5 blit verified, dstc=%#x after %d candidate(s)\n",
 +			    (uint32_t)field, tried);
