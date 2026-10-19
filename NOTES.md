@@ -2,6 +2,40 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #9: host test for the MDP5 register encoding <<<
+
+The touch driver's STOP-bit bug was caught by a host test of the wire protocol --
+not by compiling, not by CI. `bsd/dev/msm8998_mdss.c` had exactly the same
+exposure: a wrong bit in `SRC_FORMAT` or a wrong block offset compiles perfectly
+and draws garbage.
+
+New `tests/mdss_regs_test.c` + `tools/test-mdss.sh`: **32 checks**, all passing.
+They re-derive every constant independently from the Linux kernel's bitfields and
+compare against the driver:
+
+| derived | value |
+|---|---|
+| `SRC_FORMAT` (BGRA8888) | `0x000237FF` |
+| `SRC_UNPACK` | `0x01000203` |
+| `CTL_FLUSH` mask | `0x00030840` |
+
+plus: the unpack table must be a permutation of {0,1,2,3} (a duplicate drops a
+channel); bits 19-20 and 23-24 must be zero for a linear RGB surface (non-zero
+means the pipe reads it as planar and produces noise); every block base plus its
+highest register must fit inside the 0x90000 mapped window; the chiron panel
+(2160 rows at 1080x4 stride from 0x9d400000) must fit in the 32-bit WB address
+register; and the >4 GiB rejection test must actually detect a high address.
+
+The test does not include the driver -- it would then be checking the driver
+against itself. Two independent derivations agreeing is the point, and
+`test-mdss.sh` also greps the driver's `#define`s to confirm they match.
+
+The UEFI repo got the same treatment: its `test.sh` now gates on three things,
+including a UEFI structure check that pins `EFI_BOOT_SERVICES` at exactly 368
+bytes (24-byte header + 43 function pointers). That check's own first version
+had three wrong expectations while `efi.h` was right; fixing the test rather than
+the header was the correct call, and the derivation is now in the file.
+
 ### >>> UPDATE 2026-10-20 #8: chiron volume key (patch 0086) <<<
 
 **A functional gap, not a compile gap.** All the driver files carry
