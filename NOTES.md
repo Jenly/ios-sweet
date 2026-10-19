@@ -2,6 +2,83 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-19 late #2: chiron touch driver + GPU feasibility study <<<
+
+**A) Touch driver for chiron: `bsd/dev/chiron_touch.c` (+ `chiron_touch_proto.h`).**
+Written for MSM8998, **never run on hardware.** Facts it is built on, all read
+from `LineageOS/android_kernel_xiaomi_msm8998` and the chiron FDT, not guessed:
+
+- **Bus differs from sweet in kind.** chiron's touch sits on BLSP1 QUP5
+  (`i2c@c179000`, reg `<0xc179000 0x600>`), and MSM8998's QUP is **v2** — a
+  plain register state machine (`drivers/i2c/busses/i2c-qup.c`) with no
+  firmware to load. sweet's GENI SE7 needs ABL-loaded I2C firmware; none of
+  that applies here, so the driver is self-contained.
+- Pins: SDA gpio87, SCL gpio88, both `blsp_i2c5`; reset gpio89, IRQ gpio125.
+  **The mux value written is the index within that pin's own function list**,
+  not the global mux enum: `PINGROUP(87, EAST, blsp_spi5, blsp_uart2_b,
+  blsp_i2c5, ...)` gives 0=gpio, 1=spi5, 2=uart2_b, **3=i2c5**
+  (`pinctrl-msm8998.c:1798`, `pinctrl-msm.c:156-169`). Using the enum value
+  (155) would have written a different function — this was the single easiest
+  way to silently break the port.
+- Two panel variants on the same bus: Synaptics DSX at `0x20` (JDI) and
+  FocalTech ft5x46 at `0x38` (EBBG). The driver probes both and refuses to
+  guess if both answer.
+- Synaptics RMI4: PDT scan from `0x00E9` down in 6-byte entries until function
+  0 (`synaptics_dsx_core.c:2339-2423`), page select via register `0xFF`, F12
+  contact count from control register 23 (offset computed from the query-5
+  presence bitmap), 8-byte blocks `[type][x_lsb][x_msb][y_lsb][y_msb][z][wx][wy]`.
+- GCC, only touched when the QUP does not answer: BLSP1 AHB CBCR `0x17004`
+  (vote bit 17 in `0x52004`), QUP5 I2C CBCR `0x21008`, RCG `0x21020`
+  (`include/dt-bindings/clock/msm-clocks-hwio-8998.h`). Clock ids confirmed
+  from the DTB: `0x8caa5b4f`/`0xacae5604`.
+- QUP v2 protocol: FIFO words hold two `tag|byte` pairs, `START|addr<<1` first,
+  `DATA` per byte, `STOP` on the last; reads use one word with `REC|len`.
+  **Bug found by the new unit test:** my first refactor dropped the "write the
+  word even if the last byte landed in the low half" condition, which silently
+  discarded the STOP tag (a 2-byte write became 1 malformed word). Fixed in
+  `ct_pack_i2c_write()`; the test now pins it.
+
+Verification done (no macOS needed):
+- `tools/test-chiron-touch.sh` — 25 assertions over `ct_pack_i2c_write()`,
+  `ct_pack_i2c_read()` and `ct_decode_f12()`, expectations derived by hand from
+  the vendor protocol. **PASSED.** It caught two real defects (the STOP-tag bug
+  above, plus my own test's 8-bit vs 16-bit mask error).
+- Driver compiles for **arm64 with `-Wall -Wextra -Werror`** out of the fully
+  patched tree (`/root/src/xnuverify`), 7.3 KiB text.
+- Thread body executed on the host against an all-zero register file: it maps
+  its three blocks, finds the QUP silent, tries the GCC, finds that silent too,
+  and terminates cleanly instead of looping or writing to a child pointer.
+
+**Safety choices, deliberately conservative:** no writes to the touch IC's
+control registers at all (F12 report-enable is *not* programmed; see the
+comment above `rmi_scan_pdt` for what to add and when); GCC only if the QUP is
+dead; `chirontouchdelay` (default 45 s) before the first bus access;
+`chirontouch=0` kills it; every failure path prints and exits.
+
+**B) GPU: feasibility study, with a hard answer.**
+`docs/gpu-research.md` (684 lines) + `docs/mdss-blit-skeleton.c` (unwired).
+
+- **Real 3D acceleration through Adreno is impossible, and not because the
+  driver is missing.** freedreno proves the driver is merely work. The blocker
+  is the *client*: Apple's Metal/GLES compiles shaders on-device to Apple's own
+  GPU ISA and speaks Apple's AGX/IOGPU ABI. Add Qualcomm-signed a5xx microcode
+  behind PIL/TrustZone (no SCM client in this kernel) and there are three
+  independent fatal blockers. Ranked: (b) MDP blit for present **is** real
+  (removes the copy that forced the 10 Hz present cap; does not speed up
+  `CA::OGL::SW`), (c) MDP scaling would fix chiron's 276 lost rows, (d) NEON
+  tuning is nearly worthless (622 MB/s vs 29.8 GB/s — latency-bound), (a) never.
+- **Caveat recorded honestly:** the dyld shared cache is *not* on this server,
+  so QuartzCore/Metal were **not** disassembled; report §2 is sourced from the
+  port's own earlier cache RE in this file plus boot-log observations, each
+  flagged. The recommended next step is the cheap empirical one: publish a
+  decoy `IOAcceleratorES` service behind a boot-arg with IOKit trace 0049 on,
+  and read one boot's log to learn the real match strings and selectors.
+
+**Status:** patch 0082 regenerated (1549 lines, now also carries the driver and
+its `bsd/conf/files` + `sweet_ufs.c` hook); `0001-0083` applies to a clean
+xnu-8796.141.3 with **0 failures**. Nothing has been compiled by a macOS
+runner or booted on hardware.
+
 ### >>> UPDATE 2026-10-19 late: second board (chiron / Mi MIX 2) + board-agnostic kernel <<<
 
 **What changed (all committed on top of `fdad0de` "xnu 0081"):**

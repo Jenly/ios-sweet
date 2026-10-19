@@ -32,7 +32,7 @@ Adding a device means adding an entry to `tools/devices.py` (addresses, GIC layo
 | iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
 | Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software; frames are copied into the bootloader's framebuffer. Presented to iOS as an iPhone X panel (1125×2436) |
 | GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center, Settings |
-| Touch | Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events |
+| Touch | sweet: Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events. chiron: Synaptics RMI4 over BLSP I²C5 (`bsd/dev/chiron_touch.c`, written, never run on hardware) |
 | Buttons | Power, volume up/down (PMIC through SPMI) as HID consumer keys; lock/wake works |
 | Battery | IOPMPowerSource service (static 100 %, charging icon; real fuel-gauge readout prepared) |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
@@ -201,7 +201,10 @@ What is still missing, in the order it will be needed on hardware:
 2. **Framebuffer address.** The shim defaults to the address the SoC's bootloader leaves the splash at — for chiron `0x9d400000`, which is also what EDK2's `SimpleFbDxe` drives (`PcdMipiFrameBufferAddress`) and what the edk2 chiron DTB calls `splash_region` (Linux's `cont_splash_mem` is 2 MiB later, `0x9d600000`). A UEFI wrapper that knows the real GOP surface can override it at runtime with `/chosen/ios-sweet,fb-base`, `-width`, `-height`, `-stride`; the shim logs what it picked (`FB base/w/h`).
 3. **Console.** `ADT /arm-io/wdt` has `no-pmu`, so watchdogd stays happy. The kernel console draws to the panel memory the shim reports, which is how panics will be read.
 4. **Storage.** The UFS host is at `0x1da4000` (`qcom,ufshc`, same UFSHCI register layout), hardwired to the UFSHCI register block the bootloader leaves running. What is missing is the MSM8998 GCC/PHY state: if the host is not left enabled by UEFI, the `sweet_ufs.c` driver needs the MSM8998 clock and PHY registers.
-5. **Touch and buttons.** No driver yet: the Mi MIX 2 uses a Synaptics DSX (I²C `0x20`, IRQ GPIO 125, reset GPIO 89) and the PM8998 PON for the power/volume keys. The existing drivers are SM7150-specific and switch themselves off on chiron, so the phone will boot without input.
+5. **Touch and buttons.** Touch: **written, never run on hardware.** `bsd/dev/chiron_touch.c` talks RMI4 to the Synaptics DSX at I²C `0x20` on BLSP1 QUP5 (`0x00c179000`) — the MSM8998 I²C controller is QUP **v2**, a plain register state machine with no firmware to load, unlike sweet's GENI SE7 — with the I²C5 pins (SDA gpio87, SCL gpio88, mux function 3), reset gpio89 and IRQ gpio125, and it falls back to the FocalTech ft5x46 at `0x38` (the EBBG panel variant). It walks the RMI4 PDT for F01/F12, reads the contact count from the control registers, and feeds `sweet_hid_touch()`. Buttons: still missing; the Mi MIX 2 uses the PM8998 PON for power/volume, and the existing SM7150 key driver switches itself off on chiron.
+
+   Boot-args for it: `chirontouch=0` disables it, `chirontouchdelay=N` (default 45 s) delays the first bus access so a hang cannot take the GUI down with it. It only touches the GCC clocks if the QUP does not answer, and it never writes to the touch IC's control registers (see the comment above `rmi_scan_pdt`).
+
 
 ### QEMU
 
@@ -259,6 +262,7 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | 0070–0081 | Hibernation PID, touch edges, DWC3 USB device + ECM networking, 8-core SMP, display power, network tracing |
 | 0082 | Board-agnostic display and device detection: the presented screen size, the panel crop and the DPI come from `/arm-io/disp0`; the SM7150-only drivers (touch, keys, USB) switch off on other SoCs (`pexpert/SweetBoard.h`) |
 | 0083 | Board-agnostic CPU topology: any MPIDR encoding (sweet's Aff1-only cores and chiron's `0x000-0x003` + `0x100-0x103` clusters), the core name from the device tree, `ios-sweet,cpu` personality |
+| 0082 (cont.) | `bsd/dev/chiron_touch.c` + `chiron_touch_proto.h`: Synaptics RMI4 / FocalTech touch on MSM8998's BLSP I²C5 (QUP **v2**, no bootloader firmware needed — unlike sweet's GENI). Wire-format helpers unit-tested on the host by `tools/test-chiron-touch.sh` |
 
 ## Key hardware facts
 
@@ -280,6 +284,15 @@ chiron (Mi MIX 2, MSM8998) — from the device tree that edk2-porting/edk2-msm89
 - UFS host at `0x1da4000` (sweet: `0x1d84000`), `qcom,pshold` at `0x10ac000`, IMEM restart reason at `0x146bf65c`.
 - Panel: 1080×2160 (panel node `0x438`×`0x870`); the edk2 chiron DTB's `splash_region` and EDK2's `SimpleFbDxe` both use `0x9d400000` (Linux's `cont_splash_mem` is `0x9d600000`). Presenting the iPhone X screen (1125×2436) on it crops 22 px left/right and the bottom 276 rows, top-aligned so the status bar stays visible.
 - Touch: Synaptics DSX (S3330 / TD4322) on i2c `@0x20`, IRQ GPIO 125, reset GPIO 89 — **no driver yet**, so touch stays off.
+
+More in [`NOTES.md`](NOTES.md).
+
+## GPU
+
+There is no GPU driver, and the research in [`docs/gpu-research.md`](docs/gpu-research.md) explains why real 3D acceleration is a dead end here rather than a missing feature:
+
+- Apple's closed Metal/GLES driver compiles shaders **on device to Apple's own GPU ISA** and speaks Apple's AGX/IOGPU accelerator ABI. An Adreno 530 cannot execute those shaders, the accelerator user-client ABI is undocumented, and the a5xx needs Qualcomm-signed microcode (PIL/TrustZone) that this XNU has no client for. Three independent blockers, each sufficient.
+- What *is* reachable is the **present path**: replacing the CPU `memcpy` in `SweetFramebuffer::present` with an MDSS/MDP hardware blit. That does not make the software rasteriser faster — the UI stays CPU-rendered — but it removes the copy that forced the port to cap presenting at ~10 Hz. `docs/mdss-blit-skeleton.c` is the traced, unwired starting point, and the report lists the five unknowns to settle first (the biggest being whether the MMSS SMMU is left bypassed, since XNU has no IOMMU driver).
 
 More in [`NOTES.md`](NOTES.md).
 
