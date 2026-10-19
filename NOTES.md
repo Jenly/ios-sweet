@@ -2,6 +2,55 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #17: the EFI blocker, narrowed to one instruction <<<
+
+`docs/STATUS.md` ranks the EFI wrapper for the shim as the first thing to fix.
+This update does the verifiable part of it and records what remains, instead of
+writing an MMU transition that cannot be tested.
+
+**Split, done and building.** `loader.c` did two jobs: find the payload (read
+`/chosen/linux,initrd-start`) and load-and-jump. Only the first is specific to the
+ABL `boot.img` path. They are now separate:
+
+```c
+const char *loader_boot(uintptr_t dtb);                    /* reads the initrd */
+const char *loader_boot_payload(uintptr_t dtb,
+    uintptr_t payload_pa, uint64_t payload_len);            /* caller supplies it */
+```
+
+`loader_boot()` is now a wrapper and behaves identically. Verified: the shim
+rebuilds and both symbols are in `shim/out/loader.o` (`loader_boot_payload` at
+`0x0`, `loader_boot` at `0x480`). An EFI application can now hand over a payload it
+read from the ESP and reuse the reviewed segment-copy, ADT placement and
+`boot_args` code unchanged.
+
+**The blocker, stated exactly.** `loader_boot_payload()` copies in aligned 8-byte
+words and ends with `ic iallu` then a jump, because *with the MMU off all memory is
+Device memory*. An EFI application runs with the MMU **on** — that is part of the
+UEFI contract. And it cannot just switch it off: the instruction after
+`msr sctlr_el1, xzr` would be fetched through the translation that was just
+removed. Something must execute from memory valid both before and after the
+switch. That trampoline is the whole problem.
+
+The shim already builds the right page-table shape for it: `mmu.c` is a 36-bit,
+16K-granule, **identity-mapped** space, default Device-nGnRnE — which is exactly
+what makes the switch survivable and what the copier already assumes.
+
+**Written up in `shim/efi/README.md`**, including the four steps and the four
+things to check first.
+
+**One claim removed.** I had written that edk2-msm8998 publishes the DTB as a
+configuration table with a specific GUID. Grepping that tree found **no such
+GUID**, so the claim was wrong and is now recorded as a negative finding with the
+three real options (dtb partition, embedded blob, passed in) and a warning not to
+assume a config table exists.
+
+Why not finish it: every remaining step is testable only on hardware, and a mistake
+in any of them is a silent hang with no output — the console is the shim's own
+framebuffer code, which is not running yet at that point. Reporting "the EFI
+wrapper is done" from a compile would be the exact failure this project keeps
+warning about.
+
 ### >>> UPDATE 2026-10-20 #16: an honest status document, and the README caught up <<<
 
 `docs/STATUS.md` is new and is the first thing the README points at. It exists
