@@ -1,10 +1,11 @@
 /*
- * Milestone 5 probe: can we talk to the internal UFS that ABL booted from?
+ * Milestone 5 probe: can we talk to the internal UFS that the bootloader
+ * booted from?
  *
  * Runs with the MMU off (all memory Device, so DMA is coherent with no cache
- * maintenance). Dumps the UFSHCI registers ABL left behind and, if the host
- * is enabled and the link is up, points the transfer request list at our own
- * buffers and issues READ-ONLY SCSI commands on LUN 0. Nothing is ever
+ * maintenance). Dumps the UFSHCI registers the bootloader left behind and, if
+ * the host is enabled and the link is up, points the transfer request list at
+ * our own buffers and issues READ-ONLY SCSI commands on LUN 0. Nothing is ever
  * written to the device: there is no SCSI WRITE in this file.
  *
  * Register layout and descriptor formats: JEDEC UFSHCI (JESD223).
@@ -13,7 +14,8 @@
 #include "console.h"
 #include "ufs.h"
 
-#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
+#define UFS_BASE	DCFG_UFS_BASE	/* live FDT: sweet ufshc@1d84000,
+					   chiron ufshc@1da4000 */
 
 #define REG_CAP		0x00
 #define REG_VER		0x08
@@ -120,7 +122,7 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	ufs_wr(REG_UTRLDBR, 1);
 	uint64_t start = ticks();
 	while (ufs_rd(REG_UTRLDBR) & 1) {
-		if (ticks() - start > 19200000) {	/* 1 s */
+		if (ticks() - start > DCFG_TIMEBASE) {	/* 1 s */
 			ufs_wr(REG_UTRLCLR, ~1u);	/* clear slot 0 (write 0 to the bit) */
 			return 1;			/* timeout */
 		}

@@ -1,0 +1,448 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a148608..76aacc8 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -12,6 +12,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/SweetBoard.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -131,7 +132,13 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_started = true;
+-	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
++	/* The PM6150/PM6150L SPMI arbiters are at SM7150 addresses. */
++	if (!PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled)) &&
++	    !sweet_board_is_sweet()) {
++		enabled = 0;
++		printf("SWEET KEYS: not an SM7150 board, driver off "
++		    "(sweetkeys=1 forces it)\n");
++	}
+ 	if (!enabled) {
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..7f2c74a 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -14,6 +14,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/SweetBoard.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -644,7 +645,14 @@ sweet_touch_init(void)
+ 		return;
+ 	}
+ 	st.started = true;
+-	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	/* GENI SE7 at 0x00a84000 is SM7150 wiring: on another SoC those
++	 * registers belong to unrelated blocks (see pexpert/SweetBoard.h). */
++	if (!PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled)) &&
++	    !sweet_board_is_sweet()) {
++		enabled = 0;
++		printf("SWEET TOUCH: not an SM7150 board, driver off "
++		    "(sweettouch=1 forces it)\n");
++	}
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..416c3f4 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -21,6 +21,7 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/SweetBoard.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -80,8 +81,13 @@ sweet_usb_probe(void)
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+-	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
++	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB
++	 * device. The GCC and DWC3 addresses are SM7150 ones, so the default is
++	 * off on any other SoC (the MSM8998 USB work needs its own base). */
++	if (!PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled)) &&
++	    !sweet_board_is_sweet()) {
++		enabled = 0;
++	}
+ 	if (!enabled) {
+ 		return;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..cf48a6b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -35,6 +35,7 @@
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "SweetSurface.h"
++#include <pexpert/SweetBoard.h>
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+@@ -69,17 +70,16 @@ enum {
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+-#define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+- * rdar://45025538 bar for 360x800 points). The display is therefore
+- * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+- * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ * rdar://45025538 bar for 360x800 points), so the display is presented as the
++ * iPhone X panel, 1125x2436 (375x812 points @3x) -- see
++ * <pexpert/SweetBoard.h>, which takes the numbers from the device tree
++ * (/arm-io/disp0) and keeps the iPhone X values as fallbacks.  That is what
++ * makes one kernel run on both a 1080x2400 panel (sweet) and a 1080x2160 one
++ * (chiron).  Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
+-#define SWEET_FB_LOGICAL_W              1125
+-#define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -104,6 +104,7 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	uint32_t      fDotPitch;                /* ppi the userland is told */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -166,16 +167,14 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = fWidth;
+-	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+-		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
+-	}
+-	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+-	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	struct sweet_display_geometry geom;
++
++	sweet_display_geometry_for(fWidth, fHeight, &geom);
++	fLogicalW = geom.logical_w;
++	fLogicalH = geom.logical_h;
++	fOffX = geom.off_x;
++	fOffY = geom.off_y;
++	fDotPitch = geom.dots_per_inch;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -201,8 +200,9 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u at %d,%d, %u ppi\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
++	    fOffX, fOffY, fDotPitch);
+ 	return true;
+ }
+ 
+@@ -516,7 +516,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDotPitch:
+-		out[0] = SWEET_FB_DOT_PITCH;
++		out[0] = fFB->fDotPitch;
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBNotifications:
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..f1e3f6f 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -1,5 +1,7 @@
+ /*
+- * Minimal device-tree platform expert for Redmi Note 10 Pro (sweet).
++ * Minimal device-tree platform expert for the ios-sweet boards (Redmi Note
++ * 10 Pro / sweet and Mi MIX 2 / chiron: the ADT root compatible list carries
++ * "ios-sweet" on every board, so one kernel binary matches all of them).
+  * Uses XNU's normal platform, power-domain and nub initialization. Hardware
+  * interrupt and power-management services are supplied by separate drivers.
+  */
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..67a963b 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -21,6 +21,7 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/SweetBoard.h>
+ 
+ #include "IOHIDEventService.h"
+ #include "IOHIDEventServiceUserClient.h"
+@@ -432,12 +433,21 @@ SweetHIDTouch::start(IOService *provider)
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	/* Same presented-screen geometry as the framebuffer (SweetBoard.h reads
++	 * the panel size and the canvas from the device tree). */
++	struct sweet_display_geometry geom;
++	uint32_t panelW = 0, panelH = 0;
++
++	sweet_panel_size(&panelW, &panelH);
++	if (panelW == 0 || panelH == 0) {
++		panelW = SWEET_DISPLAY_LOGICAL_W;
++		panelH = SWEET_DISPLAY_LOGICAL_H;
++	}
++	sweet_display_geometry_for(panelW, panelH, &geom);
++	fLogicalW = (int)geom.logical_w;
++	fLogicalH = (int)geom.logical_h;
++	fOffX = geom.off_x;
++	fOffY = geom.off_y;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..20561e5 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -38,7 +38,7 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+-    "     'IONameMatch'     = 'xiaomi,sweet';"
++    "     'IONameMatch'     = 'ios-sweet';"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+@@ -65,7 +65,7 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'sweet,display';"
++    "     'IONameMatch'     = 'ios-sweet,display';"
+     "   },"
+     "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+diff --git a/pexpert/pexpert/SweetBoard.h b/pexpert/pexpert/SweetBoard.h
+new file mode 100644
+index 0000000..626385a
+--- /dev/null
++++ b/pexpert/pexpert/SweetBoard.h
+@@ -0,0 +1,194 @@
++/*
++ * Board identification and display geometry read from the ios-sweet device tree.
++ *
++ * The Apple Device Tree that tools/mkadt.py generates describes the phone the
++ * kernel is running on: the root "compatible" list starts with the iPhone
++ * identity whose userland this port boots (D22AP / iPhone10,3) and then names
++ * the board, and /arm-io/disp0 carries the panel and the logical (presented)
++ * screen size.  These helpers read that description during early boot so that
++ * one kernel binary serves every supported phone instead of hardcoding one
++ * board's numbers in a dozen places.
++ *
++ * Devices supported at the time of writing (see tools/devices.py):
++ *   sweet   Redmi Note 10 Pro, SM7150,  1080x2400 panel, virt timer INTID 19
++ *   chiron  Xiaomi Mi MIX 2,  MSM8998,  1080x2160 panel, virt timer INTID 27
++ *
++ * Everything here is a small inline function on purpose: it must be usable
++ * from C (bsd/dev drivers) and C++ (iokit/Kernel/arm) and needs no config
++ * option or extra translation unit.
++ */
++#ifndef _PEXPERT_SWEETBOARD_H
++#define _PEXPERT_SWEETBOARD_H
++
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++#define SWEET_BOARD_SM7150      "qcom,sm7150"   /* sweet: Redmi Note 10 Pro */
++#define SWEET_BOARD_MSM8998     "qcom,msm8998"  /* chiron: Mi MIX 2 */
++#define SWEET_BOARD_NAME        "ios-sweet"     /* root compatible, all boards */
++
++/* Fallbacks if the tree has no /arm-io/disp0 (or an older tree without the
++ * canvas/dots-per-inch properties): the iPhone X screen the userland wants. */
++#define SWEET_DISPLAY_LOGICAL_W 1125            /* 375 x 812 points @3x */
++#define SWEET_DISPLAY_LOGICAL_H 2436
++#define SWEET_DISPLAY_DPI       458
++
++/* ADT node names that the boot shim / mkadt.py generate. */
++#define SWEET_DT_DISPLAY_NODE   "disp0"
++#define SWEET_DT_FBCON_NODE     "sweet-fbcon"
++
++/*
++ * Read one 32-bit property of the ADT node with this device-tree name
++ * ("name" property value, e.g. "disp0").  Returns 1 when the property exists
++ * and is exactly one cell, 0 otherwise.
++ */
++static inline int
++sweet_dt_u32(const char *node_name, const char *prop, uint32_t *out)
++{
++	DTEntry entry;
++	void const *value = NULL;
++	unsigned int size = 0;
++
++	if (SecureDTFindEntry("name", node_name, &entry) != kSuccess) {
++		return 0;
++	}
++	if (SecureDTGetProperty(entry, prop, &value, &size) != kSuccess ||
++	    value == NULL || size != sizeof(uint32_t)) {
++		return 0;
++	}
++	*out = *(const uint32_t *)value;
++	return 1;
++}
++
++/*
++ * 1 when the ADT root "compatible" list contains this string.  mkadt.py puts
++ * "qcom,sm7150" there for sweet and "qcom,msm8998" for chiron, after the
++ * iPhone identity the userland comes from.
++ */
++static inline int
++sweet_board_has_soc(const char *soc)
++{
++	DTEntry entry;
++	void const *value = NULL;
++	unsigned int size = 0;
++	const char *list;
++	unsigned int i;
++
++	if (SecureDTLookupEntry(NULL, "/", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "compatible", &value, &size) != kSuccess ||
++	    value == NULL) {
++		return 0;
++	}
++	list = (const char *)value;
++	for (i = 0; i + 1 < size; i += (unsigned int)strlen(list + i) + 1) {
++		if (strcmp(list + i, soc) == 0) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/*
++ * The SM7150-specific drivers (touch over GENI SE7, PM6150 keys over SPMI,
++ * the DWC3 wrapper at 0x0a600000 and the GCC at 0x00100000) must not touch
++ * their registers on another SoC: those addresses belong to unrelated blocks
++ * on MSM8998.  They ask this instead of assuming real hardware.
++ */
++static inline int
++sweet_board_is_sweet(void)
++{
++	return sweet_board_has_soc(SWEET_BOARD_SM7150);
++}
++
++/* Same question for chiron, for a driver written for MSM8998 later on. */
++static inline int
++sweet_board_is_chiron(void)
++{
++	return sweet_board_has_soc(SWEET_BOARD_MSM8998);
++}
++
++/* Panel and presented screen geometry, in panel pixels. */
++struct sweet_display_geometry {
++	uint32_t panel_w, panel_h;      /* size of the panel memory */
++	uint32_t logical_w, logical_h;  /* size reported to the userland */
++	uint32_t dots_per_inch;
++	int32_t  off_x, off_y;          /* logical origin of the panel */
++};
++
++/*
++ * Work out what to present on a panel_w x panel_h frame buffer.
++ *
++ * The iOS userland only has layout and status-bar data for real iPhone
++ * screens (UIKit: "No status bar visual provider for screen", red bar for
++ * unknown point sizes), so the display is presented as the iPhone X panel,
++ * 1125x2436 (375x812 points @3x), whatever the phone has, and the panel shows
++ * the part of it that fits:
++ *
++ *   sweet  1080x2400 panel: centred, 22 px cropped left and right and 18 px
++ *          top and bottom (canvas-anchor 0 in the device tree).
++ *   chiron 1080x2160 panel: 22 px cropped left and right and top-aligned
++ *          (canvas-anchor 1), so the status bar stays on screen and the last
++ *          276 rows are off-panel.
++ *
++ * A panel that is larger than the iPhone X screen is presented at its own
++ * size (nothing would be cropped, and the point size would be nonsense), and
++ * boot-arg sweetfb_native=1 always presents the real panel size.
++ */
++static inline void
++sweet_display_geometry_for(uint32_t panel_w, uint32_t panel_h,
++    struct sweet_display_geometry *geom)
++{
++	uint32_t canvas_w = 0, canvas_h = 0, dpi = 0, anchor_top = 0;
++	int native = 0;
++
++	(void)sweet_dt_u32(SWEET_DT_DISPLAY_NODE, "canvas-width", &canvas_w);
++	(void)sweet_dt_u32(SWEET_DT_DISPLAY_NODE, "canvas-height", &canvas_h);
++	(void)sweet_dt_u32(SWEET_DT_DISPLAY_NODE, "canvas-anchor", &anchor_top);
++	(void)sweet_dt_u32(SWEET_DT_DISPLAY_NODE, "dots-per-inch", &dpi);
++	if (canvas_w == 0 || canvas_h == 0) {
++		canvas_w = SWEET_DISPLAY_LOGICAL_W;
++		canvas_h = SWEET_DISPLAY_LOGICAL_H;
++	}
++	if (dpi == 0) {
++		dpi = SWEET_DISPLAY_DPI;
++	}
++	(void)PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++
++	if (native || panel_w > canvas_w || panel_h > canvas_h) {
++		canvas_w = panel_w;
++		canvas_h = panel_h;
++		anchor_top = 0;
++	}
++	geom->panel_w = panel_w;
++	geom->panel_h = panel_h;
++	geom->logical_w = canvas_w;
++	geom->logical_h = canvas_h;
++	geom->dots_per_inch = dpi;
++	geom->off_x = ((int32_t)canvas_w - (int32_t)panel_w) / 2;
++	if (panel_h >= canvas_h || !anchor_top) {
++		geom->off_y = ((int32_t)canvas_h - (int32_t)panel_h) / 2;
++	} else {
++		geom->off_y = 0;                /* top-aligned: crop the bottom */
++	}
++}
++
++/*
++ * Panel size as recorded in the ADT (mkadt.py writes panel-width/panel-height
++ * from the same table the shim uses); fallback for an older tree.
++ */
++static inline void
++sweet_panel_size(uint32_t *w, uint32_t *h)
++{
++	uint32_t pw = 0, ph = 0;
++
++	if (!sweet_dt_u32(SWEET_DT_DISPLAY_NODE, "panel-width", &pw) ||
++	    !sweet_dt_u32(SWEET_DT_DISPLAY_NODE, "panel-height", &ph)) {
++		(void)sweet_dt_u32(SWEET_DT_FBCON_NODE, "width", &pw);
++		(void)sweet_dt_u32(SWEET_DT_FBCON_NODE, "height", &ph);
++	}
++	*w = pw;
++	*h = ph;
++}
++
++#endif /* _PEXPERT_SWEETBOARD_H */

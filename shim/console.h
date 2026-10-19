@@ -1,10 +1,18 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
-#define FB_W		1080
-#define FB_H		2400
-#define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
+/*
+ * Per-SoC constants. tools/build.sh regenerates devcfg.h from
+ * tools/devices.py for the requested --device (default sweet) before
+ * compiling; the committed copy is the Redmi Note 10 Pro one, so a bare
+ * `gcc` compile of console.c/host_test.c still works.
+ */
+#include "devcfg.h"
+
+#define FB_BASE		DCFG_FB_BASE	/* reserved-memory splash region */
+#define FB_W		DCFG_FB_W
+#define FB_H		DCFG_FB_H
+#define FB_STRIDE	DCFG_FB_STRIDE	/* a8r8g8b8, matches mainline simplefb */
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U

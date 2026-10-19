@@ -153,11 +153,22 @@ def main():
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
     ap.add_argument('--cpu', default='cortex-a76')	# ARMv8.2 like Kryo 470, same ID_AA64MMFR0
+    ap.add_argument('--device', default='sweet',
+                    help='device whose panel the framebuffer is decoded from '
+                         '(tools/devices.py: sweet 1080x2400, chiron 1080x2160)')
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     a = ap.parse_args()
     if a.fail_on_panic and not a.kernel:
         ap.error('--fail-on-panic requires --kernel')
+    # Panel memory layout of the device being tested (module globals: the
+    # decoders below read them).
+    global FB_BASE, FB_W, FB_H, FB_STRIDE
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import devices
+    dev_fb = devices.get(a.device)['fb']
+    FB_BASE, FB_W, FB_H = dev_fb['base'], dev_fb['width'], dev_fb['height']
+    FB_STRIDE = dev_fb['stride']
     payload = open(a.payload, 'rb').read()
     font = None
     if a.kernel:

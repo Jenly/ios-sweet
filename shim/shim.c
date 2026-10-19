@@ -2,8 +2,8 @@
  * Milestone 2: one boot answers the questions that decide the XNU port.
  *   - CPU feature registers (16K granule, GIC sysreg interface)
  *   - PSCI/SMCCC version and which PSCI calls the Qualcomm TZ offers
- *   - SMP: PSCI CPU_ON for the 7 secondaries, each reports its MPIDR
- *   - GICv3 Group 1 IRQ from the virtual timer (INTID 19 on Qualcomm)
+ *   - SMP: PSCI CPU_ON for the secondaries, each reports its MPIDR
+ *   - GICv3 Group 1 IRQ from the virtual timer
  * Any unexpected exception paints a blue panic screen.
  */
 #include <stdint.h>
@@ -12,14 +12,21 @@
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
+/*
+ * SoC-dependent addresses and interrupt numbers come from devcfg.h, which
+ * shim/build.sh regenerates from tools/devices.py for the board being built
+ * (that file cites the live-FDT property behind every number).
+ *   sweet  (SM7150): GICR 0x17a60000, vtimer INTID 19, UFS 0x1d84000
+ *   chiron (MSM8998): GICR 0x17b00000, vtimer INTID 27, UFS 0x1da4000
+ */
+#define IMEM_RESTART_REASON	DCFG_IMEM_RESTART
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
+#define PSHOLD			DCFG_PSHOLD
 
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
-#define GICR_SIZE		0x100000UL
-#define GICR_PE_SIZE		0x20000UL
+#define GICD_BASE		DCFG_GICD_BASE
+#define GICR_BASE		DCFG_GICR_BASE
+#define GICR_SIZE		DCFG_GICR_SIZE
+#define GICR_PE_SIZE		DCFG_GICR_STRIDE
 #define GICR_TYPER		0x08
 #define GICR_WAKER		0x14
 #define GICR_SGI		0x10000
@@ -30,8 +37,8 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
+#define VTIMER_INTID		DCFG_VTIMER_INTID
+#define PTIMER_INTID		DCFG_PTIMER_INTID
 #define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL
@@ -45,7 +52,7 @@
 #define PSCI_SYSTEM_RESET2	0xc4000012UL
 #define SMCCC_VERSION		0x80000000UL
 
-#define NR_CPUS			8
+#define NR_CPUS			DCFG_NR_CPUS
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
@@ -185,17 +192,20 @@ void secondary_main(uint64_t idx)
 
 static void __attribute__((unused)) test_smp(void)
 {
+	/* MPIDRs come from the device table: sweet has core N at Aff1=N, chiron
+	 * has the big cluster at 0x000-0x003 and the little one at 0x100-0x103. */
+	static const uint32_t mpidrs[NR_CPUS] = DCFG_MPIDRS;
 	stage = "smp";
 	uint64_t self = rsr("mpidr_el1") & 0xffffff;
 	int64_t ret[NR_CPUS];
 
 	for (int i = 1; i < NR_CPUS; i++)
-		ret[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8, (uintptr_t)secondary_entry, i);
+		ret[i] = smc(PSCI_CPU_ON, mpidrs[i], (uintptr_t)secondary_entry, i);
 	delay_ms(500);
 	for (int i = 1; i < NR_CPUS; i++) {
 		char label[] = "CPU0";
 		label[3] = '0' + i;
-		if (((uint64_t)i << 8) == self)
+		if (mpidrs[i] == self)
 			con_str(label, "is boot cpu");
 		else
 			con_hex2(label, "ret=", (uint32_t)ret[i], "mpidr=",
@@ -367,7 +377,7 @@ static uint64_t ticks_mem(void)
 
 static uint32_t to_us(uint64_t ticks)
 {
-	return ticks * 10 / 192;	/* 19.2 MHz */
+	return (uint32_t)(ticks * 1000 / (DCFG_TIMEBASE / 1000));	/* CNTFRQ */
 }
 
 void shim_main(uint64_t dtb)
@@ -377,7 +387,7 @@ void shim_main(uint64_t dtb)
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
+	con_str("SHIM", DCFG_DEVICE " milestone 4: xnu loader");
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
@@ -405,7 +415,7 @@ void shim_main(uint64_t dtb)
 	if (rc)
 		con_clear(RED);
 
-	con_str("SHIM", "sweet milestone 3");
+	con_str("SHIM", DCFG_DEVICE " milestone 3");
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);

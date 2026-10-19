@@ -2,6 +2,83 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-19 late: second board (chiron / Mi MIX 2) + board-agnostic kernel <<<
+
+**What changed (all committed on top of `fdad0de` "xnu 0081"):**
+
+- **`tools/devices.py` is now the single source of per-SoC facts.** Entries for
+  `sweet` (SM7150, unchanged values) and `chiron` (MSM8998, new). Every number
+  in the chiron entry cites where it came from: the live FDT
+  `Platforms/Msm8998Pkg/Device/xiaomi/chiron/DeviceTreeBlob/Android/Android-chiron.dtb`
+  from `edk2-porting/edk2-msm8998` (decompiled with `dtc`), and
+  `arch/arm64/boot/dts/qcom/{msm8998.dtsi,xiaomi/chiron-msm8998-mtp.dtsi}` from
+  `LineageOS/android_kernel_xiaomi_msm8998` (both cloned on the build server
+  under `/root/src/`). Observation, not guess: chiron's GIC redistributor is at
+  `0x17b00000` (sweet `0x17a60000`), the virtual timer is INTID 27 (sweet 19),
+  UFS is at `0x1da4000` (sweet `0x1d84000`), cores are 0x000-0x003 (Gold,
+  first in the DT) + 0x100-0x103 (Silver), memory is `0x40000000`+3G and
+  `0x100000000`+`0xbd8c0000`, and the panel is 1080x2160.
+- **`tools/gen_devcfg.py` -> `shim/devcfg.h`.** `shim/build.sh` regenerates it
+  per `--device` (default sweet) and now takes `--device NAME`; the FB base and
+  size, GICD/GICR, PSHOLD/IMEM, UFS base, NR_CPUS and MPIDR list are macros
+  instead of literals in `shim.c`/`ufs.c`/`console.h`/`mmu.h`. `mkbootimg` is
+  found defensively (Debian's package is broken: it needs the AOSP `gki`
+  module, so `MKBOOTIMG=/root/src/edk2-msm8998/mkbootimg.py` is used). Boot
+  image output is `shim/out/shim-boot-<device>.img` plus the old
+  `shim-boot.img` symlink-copy, and the DTB is optional per device
+  (`DTB=` for chiron).
+- **`tools/mkadt.py --device`.** CPU list/MPIDRs, GIC addresses, timer INTID,
+  UFS node and RAM window come from the table; `disp0` now also carries
+  `canvas-anchor`, `dots-per-inch`, `panel-width` and `panel-height`, and the
+  root compatible list gains `ios-sweet` (board-independent personality match)
+  *after* the iPhone identity. Old properties and their values are unchanged;
+  `--qemu` still emits one CPU. Verified: the only ADT differences against the
+  previous generator for sweet are the added properties.
+- **xnu patch 0082 `0082-sweet-board-agnostic-display.patch`** (applies cleanly
+  onto 0001-0081 in a fresh xnu-8796.141.3 tree; 8 files, +260/-33):
+  - new `pexpert/pexpert/SweetBoard.h`: `sweet_board_has_soc()`,
+    `sweet_board_is_sweet()`, `sweet_dt_u32()`, `sweet_panel_size()`,
+    `sweet_display_geometry_for()`.
+  - `SweetFramebuffer.cpp`: logical size, crop offset and dot pitch come from
+    the ADT instead of the hardcoded 1125x2436/458; the log line prints them.
+  - `hid/SweetHID.cpp`: same geometry for the digitizer mapping.
+  - `KernelConfigTables.cpp`: personalities match `ios-sweet` /
+    `ios-sweet,display` (the ADT still carries `xiaomi,sweet` and
+    `<device>,display`, so an older kernel keeps working with a new ADT).
+  - `sweet_touch.c`, `sweet_keys.c`, `sweet_usb.c`: SM7150 MMIO addresses, so
+    they switch off on another SoC unless forced with `sweettouch=1` etc.
+  - `iokit/KernelConfigTables.cpp` personality + platform expert comment.
+- **`tools/test-board-header.py`** compiles and *runs* `SweetBoard.h` against
+  real generated ADTs with stubbed `SecureDT*` calls (C and C++). Result for
+  sweet: presented 1125x2436 at 22,18, panel shows logical x 22..1101,
+  y 18..2417 (unchanged behaviour). For chiron: presented 1125x2436 at 22,0,
+  panel shows y 0..2159 (top-aligned, 276 rows off-panel); `sweetfb_native=1`
+  gives 1080x2160 at 0,0. SoC detection: sweet -> sm7150=1, chiron -> msm8998=1.
+- **`tools/ipsw.py`**: ipsw.me queries (`list`, `info`), resumable download with
+  SHA-1/SHA-256 verification (`fetch`), and single-member extraction over HTTP
+  ranges (`extract`). Used it for real: `info` reports iPhone10,3 16.7.16
+  (20H392) 6,171,035,648 bytes, SHA-1 `5606c298...`, signed; `extract
+  DeviceTree.d22ap` pulled 33,719 bytes, CRC ok, and `tools/adt.py unwrap`
+  produced `research/ipsw-x/d22ap.adt` (186,084 bytes) -- so `mkadt.py` now
+  emits the real `/product` node again on this server.
+- `tools/qemu-sweet.py --device` picks the panel geometry for the fb decoding.
+
+**Verification done on the server (Linux, no macOS, so no kernel compile):**
+
+- `shim/build.sh --device sweet` and `--device chiron` both build
+  (`out/Image` 180,224 bytes, `out/shim-boot-<device>.img` 614,400 bytes).
+- `tools/test-board-header.py` passes for both ADTs (C + C++).
+- All python tools `py_compile` clean; patch 0082 `git apply --check` OK on a
+  clean 0001-0081 tree, and the reapplied tree matches the authored one.
+
+**Not done / next (chiron):** kernel CI run with 0082 (the patch is only
+apply-checked, never compiled by a macOS runner yet); a UEFI boot path for
+MSM8998 (edk2-msm8998 loads the shim, and it must pass the GOP framebuffer
+address rather than the `0x9d600000` splash region); MSM8998 UFS clock/PHY
+state if UEFI does not leave the host enabled; Synaptics DSX touch driver and
+PM8998 PON keys. sweet is unaffected: same ADT semantics, same boot-args,
+same kernel behaviour apart from the values now coming from the ADT.
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**
