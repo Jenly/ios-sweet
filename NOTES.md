@@ -2,6 +2,65 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #18: the EFI trampoline, verified by disassembly <<<
+
+The trampoline that `shim/efi/README.md` called the whole problem now exists as
+`shim/efi_handoff.c`, and the part that can be checked without hardware has been.
+
+**The shape of it.** `efi_handoff()` builds the shim's identity map with
+`mmu_enable()`, checks that the physical address the EFI caller reports actually
+falls inside the range that map made executable, and then calls
+`drop_mmu_and_jump()`, which clears exactly `SCTLR_EL1` bits M, C and I and branches
+to `loader_boot_payload()`.
+
+**Why `msr sctlr_el1, xzr` is wrong and is not used.** SCTLR_EL1 has RES1 bits an
+implementation may require to stay set, and clearing them is CONSTRAINED
+UNPREDICTABLE. The code reads the register and clears three bits, leaving the rest
+as firmware left it. The disassembly shows exactly that:
+
+```
+c:  dsb  sy
+10: mrs  x9, sctlr_el1
+14: and  x9, x9, #0xfffffffffffffffe     ; bit 0  M
+18: and  x9, x9, #0xfffffffffffffffb     ; bit 2  C
+1c: and  x9, x9, #0xffffffffffffefff     ; bit 12 I
+20: msr  sctlr_el1, x9
+24: isb
+28: mov  x0, x5      ; dtb
+2c: mov  x1, x6      ; payload_pa
+30: mov  x2, x3      ; payload_len
+34: br   x4
+```
+
+`tools/test-efi-handoff.sh` asserts that sequence: a `dsb` precedes the read, the
+register is read before being written, exactly those three bits are cleared and no
+others, exactly one `isb` sits between the `msr` and the branch, no memory access
+happens in that window, the branch is indirect, and the three arguments land in
+x0/x1/x2.
+
+**Verified able to fail, four injected bugs:**
+
+| injected | caught by |
+|---|---|
+| `msr sctlr_el1, xzr` | "SCTLR is not being read first" |
+| clear bit 13 instead of 12 | "clears the bit with mask ...efff: want yes got no" |
+| drop the `dsb` | "a dsb precedes the sctlr read: want yes got no" |
+| `bl` instead of `br` | "exactly one isb sits between msr and br: want 1 got 0" |
+
+The third one was **not** caught on the first attempt: my mask check printed a note
+and never failed, so an off-by-one in the cleared bit passed silently. That is the
+one bug class the test exists for, so it is now a strict check with a count.
+
+**A correction.** Commit `a917d6f` says "a missing prerequisite is a skip, not a
+failure" and implies `tools/test.sh` was changed. It was not — `git show a917d6f --
+tools/test.sh` is empty. I had edited the file on the server, then uploaded a stale
+local copy over it, so the commit captured the workflow change and this file but not
+that one. The skip logic is now actually in place and was verified by hiding `dtc`:
+`shim FDT  skipped (dtc not installed ...)` and the summary gains
+"note: skipped checks did not run, so they prove nothing either way".
+
+`tools/test.sh` now runs **seven** checks, all passing.
+
 ### >>> UPDATE 2026-10-20 #17: the EFI blocker, narrowed to one instruction <<<
 
 `docs/STATUS.md` ranks the EFI wrapper for the shim as the first thing to fix.

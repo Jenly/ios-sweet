@@ -52,16 +52,25 @@ skip() {
 
 echo "== self-contained host tests =="
 
-# MDP5 register encoding, re-derived from the Linux bitfields.
+# MDP5 register encoding, re-derived from the Linux bitfields. Needs a host C
+# compiler; without one the test cannot speak about the code at all.
 if [ -x tools/test-mdss.sh ]; then
-	run "MDP5 register encoding" ./tools/test-mdss.sh
+	if command -v cc >/dev/null 2>&1; then
+		run "MDP5 register encoding" ./tools/test-mdss.sh
+	else
+		skip "MDP5 register encoding" "no host C compiler"
+	fi
 else
 	skip "MDP5 register encoding" "tools/test-mdss.sh missing"
 fi
 
 # PSHOLD preflight rule: the pure function the restart driver calls.
 if [ -x tools/test-restart.sh ]; then
-	run "PSHOLD preflight" ./tools/test-restart.sh
+	if command -v cc >/dev/null 2>&1; then
+		run "PSHOLD preflight" ./tools/test-restart.sh
+	else
+		skip "PSHOLD preflight" "no host C compiler"
+	fi
 else
 	skip "PSHOLD preflight" "tools/test-restart.sh missing"
 fi
@@ -80,9 +89,28 @@ else
 	skip "touch protocol + drift" "tools/test-chiron-touch.sh missing"
 fi
 
+# The EFI handoff trampoline: the MMU/cache drop, verified instruction by
+# instruction from the disassembly. Needs a cross compiler and objdump; without
+# them it has said nothing about the code.
+if [ -x tools/test-efi-handoff.sh ]; then
+	XC=${CROSS_COMPILE:-aarch64-linux-gnu-}
+	if command -v "${XC}gcc" >/dev/null 2>&1 &&
+	    command -v "${XC}objdump" >/dev/null 2>&1; then
+		run "EFI handoff trampoline" ./tools/test-efi-handoff.sh
+	else
+		skip "EFI handoff trampoline" "no aarch64 cross compiler/objdump"
+	fi
+else
+	skip "EFI handoff trampoline" "tools/test-efi-handoff.sh missing"
+fi
+
 # The shim's FDT handling.
 if [ -f tools/test-shim-fdt.py ]; then
-	run "shim FDT" python3 tools/test-shim-fdt.py
+	if command -v dtc >/dev/null 2>&1; then
+		run "shim FDT" python3 tools/test-shim-fdt.py
+	else
+		skip "shim FDT" "dtc not installed (apt/brew install dtc)"
+	fi
 else
 	skip "shim FDT" "tools/test-shim-fdt.py missing"
 fi
@@ -125,6 +153,9 @@ fi
 
 echo
 echo "$ran check(s) ran, $skipped skipped, $fail failed"
+if [ $skipped -gt 0 ]; then
+	echo "note: skipped checks did not run, so they prove nothing either way"
+fi
 if [ $fail -eq 0 ]; then
 	echo "ALL HOST CHECKS PASSED"
 	exit 0
