@@ -104,6 +104,16 @@ else
 	skip "EFI handoff trampoline" "tools/test-efi-handoff.sh missing"
 fi
 
+# The EFI application's PE headers. "It built" is not "firmware can load it": a
+# wrong machine type, PE32 instead of PE32+, or subsystem 3 instead of 10 all link
+# without complaint and are then rejected with no useful message. Skipped when
+# shim.efi has not been produced, with the reason.
+if [ -f shim/out/shim.efi ]; then
+	run "EFI image headers" ./tools/test-efi-image.sh
+else
+	skip "EFI image headers" "shim.efi not built (needs clang + lld-link)"
+fi
+
 # The shim's FDT handling.
 if [ -f tools/test-shim-fdt.py ]; then
 	if command -v dtc >/dev/null 2>&1; then

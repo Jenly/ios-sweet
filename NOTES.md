@@ -2,6 +2,48 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #19: the shim builds as an EFI application <<<
+
+`./shim/build.sh` now produces **two** outputs from the same sources:
+
+| output | status |
+|---|---|
+| `out/Image` (184,320 bytes) | unchanged, still the route that boots today |
+| `out/shim.efi` (9,216 bytes) | **PE32+ AArch64 EFI application**, loads and links cleanly |
+
+Three real link errors had to be solved, and each is worth recording because each
+will recur:
+
+1. **`_head` / `_end` don't exist in a PE link.** `mmu.c` takes the running image's
+   extent from those linker symbols. `mmu_enable()` now accepts an override
+   (`mmu_image_lo/hi`); zero keeps the old behaviour, so the raw `Image` build is
+   byte-for-byte unchanged. `efi_stubs.c` defines the two symbols as **one byte
+   each** so the link succeeds, and `efi_handoff()` **refuses to run** unless the
+   real extent was supplied -- mapping a one-byte "image" execute-never and faulting
+   on the next fetch would be worse than an error message.
+2. **`strcmp` is not in an EFI application.** `ufs.c` uses it for partition
+   listing. The EFI target simply does not link `ufs.c` or `shim.c` -- the
+   application has its own entry point and has no use for the boot.img main flow.
+3. **`test_ufs` was referenced by it.** Same cause, same fix.
+
+`tools/test-efi-image.sh` reads the PE headers rather than trusting the linker:
+`MZ`, PE signature, machine `0xAA64`, PE32+ magic `0x20B`, **subsystem 10**
+(`EFI_APPLICATION`), non-zero entry RVA inside the image, image base and
+`SizeOfImage` both 4K aligned. "It built" is not "firmware can load it" -- a PE32
+or subsystem-3 image links happily and is rejected with no useful message.
+
+Two build-ordering bugs found by running it: the EFI target sat after `mkbootimg`,
+which fails on this host, so `set -e` skipped it entirely; and my first attempt
+linked a hand-written object list that omitted `ufs.o` and then included it, giving
+contradictory errors. The final file list is the minimal one that actually links.
+
+`tools/test.sh` now runs **eight** checks, all passing.
+
+**Still not done, and stated plainly in `shim/efi/README.md`:** `efi_main()` does
+not read the payload from a file and cannot obtain the device tree, so it reports
+both and returns. The trampoline it would use is built and disassembly-verified but
+has never executed.
+
 ### >>> UPDATE 2026-10-20 #18: the EFI trampoline, verified by disassembly <<<
 
 The trampoline that `shim/efi/README.md` called the whole problem now exists as

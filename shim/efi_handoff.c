@@ -1,4 +1,4 @@
-/*
+﻿/*
  * efi_handoff.c -- enter the kernel from an EFI-loaded image.
  *
  * THE PROBLEM THIS SOLVES. loader_boot_payload() writes memory in aligned 8-byte
@@ -100,8 +100,8 @@ drop_mmu_and_jump(uintptr_t fn, uint64_t a0, uint64_t a1, uint64_t a2)
  * Returns only on error, before the point of no return.
  */
 const char *
-efi_handoff(uintptr_t shim_pa, uintptr_t dtb, uintptr_t payload_pa,
-    uint64_t payload_len)
+efi_handoff(uintptr_t shim_pa, uintptr_t shim_len, uintptr_t dtb,
+    uintptr_t payload_pa, uint64_t payload_len)
 {
 	struct mmu_info info;
 
@@ -110,16 +110,28 @@ efi_handoff(uintptr_t shim_pa, uintptr_t dtb, uintptr_t payload_pa,
 	con_hex2("EFI", "payload=", payload_pa, "len=", payload_len);
 
 	/*
-	 * mmu_enable() maps `_head .. _end` of THIS image Normal write-back and the
-	 * rest Device/execute-never. If we are not executing from inside that range,
-	 * enabling the map would make the next instruction fetch fail.
+	 * A PE image is not one contiguous range, so its extent has to be supplied:
+	 * there are no `_head`/`_end` equivalents in a PE link and efi_stubs.c's
+	 * placeholders are one byte. Refusing here is better than mapping a one-byte
+	 * "image" execute-never and faulting on the next fetch.
+	 */
+	if (shim_pa == 0 || shim_len == 0) {
+		return "the image's own extent was not supplied; cannot map it";
+	}
+	mmu_image_lo = shim_pa;
+	mmu_image_hi = shim_pa + shim_len;
+
+	/*
+	 * mmu_enable() maps the image Normal write-back and the rest
+	 * Device/execute-never. If the supplied range does not contain the code we
+	 * are executing, enabling the map makes the next instruction fetch fail.
 	 */
 	if (mmu_enable(&info) != 0) {
 		return "mmu_enable failed: the image spans more than two 32MB blocks";
 	}
 	con_hex2("EFI", "img_lo=", info.img_lo, "img_hi=", info.img_hi);
 
-	if (shim_pa != 0 && (shim_pa < info.img_lo || shim_pa >= info.img_hi)) {
+	if (shim_pa < info.img_lo || shim_pa >= info.img_hi) {
 		/*
 		 * The caller's idea of where this image lives is outside the range just
 		 * mapped executable. Say so and stop: continuing would fault at the next

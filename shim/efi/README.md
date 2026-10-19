@@ -84,7 +84,35 @@ blob as the trampoline rather than into the EFI PE — i.e. build the shim as **
 pieces: a small EFI application that does file I/O and `ExitBootServices`, and the
 existing shim payload, which the EFI application loads next to itself and enters.
 
-## Why it has not been done here
+## It builds now
+
+`./shim/build.sh` produces **two** outputs from the same sources:
+
+| output | how it is used |
+|---|---|
+| `out/Image` | the raw payload for `mkbootimg` + `fastboot boot` -- unchanged, still the supported route |
+| `out/shim.efi` | a PE32+ AArch64 EFI application, loadable by firmware and by the `sweet-uefi` menu |
+
+The EFI target is built **before** the boot.img step, because `mkbootimg` fails on
+some hosts (Debian's wrapper wants the AOSP `gki` module) and `set -e` would then
+skip it. The two outputs are independent.
+
+`shim/efi_main.c` is the entry point; `shim/efi_app.h` declares the little UEFI it
+needs with every field offset pinned by `_Static_assert` against the values the
+`sweet-uefi` project verified against the specification; `shim/efi_stubs.c`
+supplies `_head`/`_end`, which a PE link has no equivalent of.
+
+`tools/test-efi-image.sh` reads the PE headers and asserts what decides whether
+firmware will load it: `MZ`, the PE signature, machine `0xAA64`, PE32+ magic
+`0x20B`, subsystem 10 (`EFI_APPLICATION`), a non-zero entry RVA inside the image,
+and 4K alignment of both the image base and `SizeOfImage`. Twelve checks.
+
+What it still does not do: read the payload from a file, or obtain the device tree.
+`efi_main()` reports both and returns. That is deliberate -- a launcher that claims
+to boot and then silently returns would be worse than one that names what it is
+missing.
+
+## Why the jump itself has not been run
 
 Every step above is testable only on hardware, and a mistake in any of them is a
 silent hang with no output: the serial console is the shim's own framebuffer code,

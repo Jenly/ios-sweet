@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 # Build the shim and wrap it in a boot.img v2.
 #
 #   ./build.sh                 # sweet: kernel-only build (no payload), needs ../dtb/
@@ -82,6 +82,34 @@ else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
 
+
+# ---- EFI application -------------------------------------------------------
+# Built BEFORE the boot.img step on purpose: mkbootimg fails on some hosts
+# (Debian's wrapper wants the AOSP 'gki' module) and set -e would then skip
+# this entirely. The two outputs are independent.
+if command -v clang >/dev/null 2>&1 && command -v lld-link >/dev/null 2>&1; then
+	EFIFLAGS="-target aarch64-pc-win32-coff -O2 -ffreestanding -fno-stack-protector -fno-builtin -mgeneral-regs-only -fshort-wchar -Wall -Wextra -I."
+	ok=1
+	# NOT shim.c or ufs.c: the EFI application has its own entry point and needs
+	# none of the boot.img main flow, and ufs.c drags in strcmp for partition
+	# listing, which an EFI application has no libc to provide.
+	for f in console.c mmu.c fdt.c loader.c efi_handoff.c efi_stubs.c efi_main.c; do
+		# shellcheck disable=SC2086
+		clang $EFIFLAGS -c "$f" -o "out/efi-${f%.c}.o" || ok=0
+	done
+	if [ "$ok" = 1 ]; then
+		lld-link /subsystem:efi_application /entry:efi_main /machine:arm64 \
+			/nodefaultlib /out:out/shim.efi \
+			out/efi-console.o out/efi-mmu.o out/efi-fdt.o out/efi-loader.o \
+			out/efi-efi_handoff.o out/efi-efi_stubs.o out/efi-efi_main.o \
+			&& echo "  out/shim.efi: $(stat -c%s out/shim.efi 2>/dev/null || stat -f%z out/shim.efi) bytes"
+	else
+		echo "  note: some EFI objects failed to compile; shim.efi not produced" >&2
+	fi
+else
+	echo "  note: clang/lld-link not found; skipping the EFI application target" >&2
+fi
+
 # mkbootimg: Debian/Ubuntu ship a wrapper that needs the AOSP python package
 # ("No module named 'gki'").  Try the usual names and keep the first that runs;
 # MKBOOTIMG=/path/to/mkbootimg.py overrides (edk2-msm8998 has a plain copy).
@@ -108,4 +136,6 @@ fi
 cp "out/shim-boot-$DEVICE.img" out/shim-boot.img
 # Host render of the console layout (device independent).
 gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
-ls -l out/Image out/shim-boot.img
+
+# EFI target runs before this line
+ls -l out/Image 2>/dev/null; ls -l out/shim.efi 2>/dev/null

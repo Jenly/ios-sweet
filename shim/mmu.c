@@ -72,10 +72,23 @@ static void zero_table(uint64_t *t)
 		t[i] = 0;
 }
 
+/*
+ * Optional explicit image extent, for callers whose linker provides no `_head` and
+ * `_end` -- a PE32+ EFI application, for instance. Both zero (the default) means
+ * "use the linker symbols", so the raw Image build is unchanged.
+ *
+ * The range is what this function needs; where it comes from is the caller's
+ * business. Zero is unambiguous as "not supplied": nothing here loads at address 0.
+ */
+uintptr_t mmu_image_lo;
+uintptr_t mmu_image_hi;
+
 int mmu_enable(struct mmu_info *info)
 {
-	uintptr_t img_lo = (uintptr_t)_head & ~(PG_SIZE - 1);
-	uintptr_t img_hi = ((uintptr_t)_end + PG_SIZE - 1) & ~(PG_SIZE - 1);
+	uintptr_t lo = mmu_image_lo ? mmu_image_lo : (uintptr_t)_head;
+	uintptr_t hi = mmu_image_hi ? mmu_image_hi : (uintptr_t)_end;
+	uintptr_t img_lo = lo & ~(PG_SIZE - 1);
+	uintptr_t img_hi = (hi + PG_SIZE - 1) & ~(PG_SIZE - 1);
 	uintptr_t pool = ((uintptr_t)pt_pool + PG_SIZE - 1) & ~(PG_SIZE - 1);
 	uint64_t *l2 = (uint64_t *)pool;
 	int n_l3 = 0;
