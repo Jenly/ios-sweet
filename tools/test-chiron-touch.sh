@@ -215,4 +215,13 @@ for src in bsd/dev/chiron_touch.c bsd/dev/chiron_touch_proto.h \
 		exit 1
 	fi
 done
+echo "USB SoC table check"
+if python3 "$(dirname "$0")/test-usb-soc.py" bsd/dev/sweet_usb.c \
+    > "$OUT/usb-soc.txt" 2>&1; then
+	tail -3 "$OUT/usb-soc.txt"
+else
+	cat "$OUT/usb-soc.txt" >&2
+	echo "  USB SoC table check FAILED" >&2
+	exit 1
+fi
 echo "drift check OK"

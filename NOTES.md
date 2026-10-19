@@ -2,6 +2,53 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #11: USB per-SoC table (0088) <<<
+
+`sweet_usb.c` had SM7150's USB addresses hardcoded and returned early on every
+other board -- its own comment said so: "the MSM8998 USB work needs its own base".
+The probe only needs six facts, so they moved into a table rather than a second
+implementation. **Sweet's values are byte-identical, so that path cannot regress.**
+
+MSM8998, each traced to a line:
+
+| fact | value | source |
+|---|---|---|
+| GCC base | `0x100000` | `msm8998.dtsi:938` |
+| GCC size | **`0xB0000`** | `msm8998.dtsi:940` |
+| USB30 GDSC | `0xF004` | absolute `0x10F004` minus GCC base |
+| DWC3 | `0xA800000` | `msm8998.dtsi:1934` |
+| QUSB2 PHY | `0xC012000` | `msm8998.dtsi:1981` |
+| master/sleep/utmi/phy-aux CBCR | `0xF008/0xF00C/0xF010/0x50000` | `msm-clocks-hwio-8998.h:205-209` |
+| cfg-noc/aggre1 AXI | `0x05018/0x82024` | `msm-clocks-hwio-8998.h:163,125` |
+| clkref | `0x88008` | `msm-clocks-hwio-8998.h:119` |
+
+**The new host test earned its place immediately -- it caught two of my own
+mistakes.**
+
+`tools/test-usb-soc.py` parses the table out of the driver as text and compares
+against expectations transcribed independently from the sources, so the two
+derivations cannot drift together.
+
+1. **GCC window too small.** I copied sweet's `0x90000`. MSM8998's is `0xB0000`.
+   The USB30 GDSC at `0x10F004` would have been read 0x6F004 bytes past the end
+   of the mapping on chiron -- a fault on the first power-domain read.
+2. **GDSC offset misread.** I took the DTS `reg = <0x10f004 0x4>` as a block
+   offset. It is an absolute address: `gdsc.c:482-485` does
+   `devm_ioremap(res->start, ...)`. So the offset is `0x10F004 - 0x100000 =
+   0xF004`, the same value sweet already used. My "both SoCs must differ here"
+   assertion was itself wrong and was removed.
+
+**And I had to fix the gate itself.** I first wired the test in as
+`python3 test-usb-soc.py ... | tail -3`, which always exits 0 because `tail`
+succeeds -- so the run printed "drift check OK" while the test had actually
+raised `FileNotFoundError`. Fixed to redirect, print, and propagate the status.
+Then proved it: corrupting `MSM8998.dwc3_pa` to sweet's value makes the test
+report two failures and the script exit non-zero; restoring it passes again.
+
+Verified: 0001-0088 applies with 0 failures, 10/10 TUs compile, 618/618 undefined
+symbols resolve with 0 orphans, header-export clean, MDP5 (32 checks) and USB
+(53 checks) host tests pass, drift check passes for all ten created files.
+
 ### >>> UPDATE 2026-10-20 #10: first-boot hardware report (0087) <<<
 
 chiron has never run this kernel. On the first boot the only thing that matters

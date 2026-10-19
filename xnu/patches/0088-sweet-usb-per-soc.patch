@@ -1,0 +1,195 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -43,28 +43,111 @@
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+-#define GCC_PA                  0x00100000
+-#define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+-static const struct {
++#define USB_CBCR_SLOTS          7
++
++struct usb_clock {
+ 	const char *name;
+ 	uint32_t    off;
+-} usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
+ };
+ 
+-#define DWC3_PA                 0x0a600000
+-#define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
++/*
++ * Everything this driver needs that differs between SoCs. Five facts and one
++ * diagnostic list; each value is cited where it is set below.
++ */
++struct usb_soc {
++	const char          *soc;
++	uint32_t             gcc_pa, gcc_size;
++	uint32_t             gdscr_off;      /* bit 31 = power on */
++	uint32_t             dwc3_pa, dwc3_size;
++	uint32_t             qusb2_pa, qusb2_size;
++	struct usb_clock     clk[USB_CBCR_SLOTS];
++};
++
++/*
++ * SM7150 / sweet. These are the values this driver has always used; they are
++ * unchanged so the sweet path cannot regress.
++ */
++static const struct usb_soc usb_soc_sweet = {
++	.soc        = "SM7150",
++	.gcc_pa     = 0x00100000,
++	.gcc_size   = 0x00090000,   /* the SM7150 GCC block; smaller than 8998's */
++	.gdscr_off  = 0x0f004,
++	.dwc3_pa    = 0x0a600000,
++	.dwc3_size  = 0x0000d000,
++	.qusb2_pa   = 0x088e2000,
++	.qusb2_size = 0x00000400,
++	.clk = {
++		{ "master",      0x0f010 },
++		{ "sleep",       0x0f014 },
++		{ "utmi",        0x0f018 },
++		{ "cfg-noc-axi", 0x0502c },
++		{ "aggre-axi",   0x8201c },
++		{ "ahb2phy",     0x6a004 },
++		{ "clkref",      0x8c010 },
++	},
++};
++
++/*
++ * MSM8998 / chiron. Sources, one per line:
++ *   msm-gdsc-8998.dtsi:16-20        gdsc_usb30 at 0x10f004
++ *   msm-clocks-hwio-8998.h:205-209  USB30_MASTER/SLEEP/MOCK_UTMI/PHY_AUX CBCR
++ *   msm-clocks-hwio-8998.h:163,125  CFG_NOC_USB3_AXI, AGGRE1_USB3_AXI
++ *   msm-clocks-hwio-8998.h:119      GCC_USB3_CLKREF_EN
++ *   msm8998.dtsi:1934-1936          dwc3@a800000, reg 0x0a800000 0xcd00
++ *   msm8998.dtsi:1981-1983          qusb@c012000, qcom,qusb2phy-v2
++ *
++ * The GCC base is the same physical address as on SM7150 because it is the same
++ * controller block on both SoCs; only the register offsets inside it differ.
++ */
++static const struct usb_soc usb_soc_chiron = {
++	.soc        = "MSM8998",
++	/* msm8998.dtsi:938-941 -- clock_gcc@100000, reg = <0x100000 0xb0000>. */
++	.gcc_pa     = 0x00100000,
++	.gcc_size   = 0x000b0000,
++	/*
++	 * msm-gdsc-8998.dtsi:16-20 has the USB30 GDSC at absolute 0x10f004, and
++	 * gdsc.c:485 ioremaps that address directly, so the offset inside the GCC
++	 * block is 0x10F004 - 0x100000 = 0xf004 -- the same place as on SM7150.
++	 */
++	.gdscr_off  = 0x0000f004,
++	.dwc3_pa    = 0x0a800000,
++	.dwc3_size  = 0x0000d000,
++	.qusb2_pa   = 0x0c012000,
++	.qusb2_size = 0x00000400,
++	.clk = {
++		{ "master",      0x0F008 },
++		{ "sleep",       0x0F00C },
++		{ "utmi",        0x0F010 },
++		{ "cfg-noc-axi", 0x05018 },
++		{ "aggre-axi",   0x82024 },
++		/* MSM8998 has no separate ahb2phy branch; PHY_AUX is the nearest
++		 * equivalent and is reported under its own name. */
++		{ "phy-aux",     0x50000 },
++		{ "clkref",      0x88008 },
++	},
++};
++
++/* Chosen once, from the board the device tree describes. */
++static const struct usb_soc *usb_soc;
++
++/*
++ * Pure lookup, so tools/test-usb-soc.py can call it for both boards on the host
++ * instead of trying to fake the device tree. The probe passes the board it
++ * actually detected.
++ */
++const struct usb_soc *
++sweet_usb_soc_for(int is_chiron)
++{
++	return is_chiron ? &usb_soc_chiron : &usb_soc_sweet;
++}
++
++static const struct usb_soc *
++usb_pick_soc(void)
++{
++	return sweet_usb_soc_for(sweet_board_is_chiron() ? 1 : 0);
++}
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -78,29 +161,34 @@
+ sweet_usb_probe(void)
+ {
+ 	int enabled = 1;
+-	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
++	uint32_t gdscr, cbcr[USB_CBCR_SLOTS];
+ 	bool clocks_on = true;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB
+-	 * device. The GCC and DWC3 addresses are SM7150 ones, so the default is
+-	 * off on any other SoC (the MSM8998 USB work needs its own base). */
+-	if (!PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled)) &&
+-	    !sweet_board_is_sweet()) {
++	/*
++	 * The SoC-specific addresses now come from usb_soc (see usb_pick_soc), so
++	 * this no longer has to be off on MSM8998. It is still opt-in: the probe
++	 * reads the DWC3 and PHY blocks, and a board whose GCC says those power
++	 * domains are off could stall the bus on the first access.
++	 */
++	if (!PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled))) {
+ 		enabled = 0;
+ 	}
+ 	if (!enabled) {
+ 		return;
+ 	}
+-	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	usb_soc = usb_pick_soc();
++	printf("SWEET USB: probing %s at DWC3 0x%x, PHY 0x%x\n",
++	    usb_soc->soc, usb_soc->dwc3_pa, usb_soc->qusb2_pa);
++	vm_offset_t gcc = ml_io_map(usb_soc->gcc_pa, usb_soc->gcc_size);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
+-	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	gdscr = usb_rd(gcc, usb_soc->gdscr_off);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+-	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
++	for (unsigned i = 0; i < USB_CBCR_SLOTS; i++) {
++		cbcr[i] = usb_rd(gcc, usb_soc->clk[i].off);
++		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_soc->clk[i].name, cbcr[i],
+ 		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
+ 	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+@@ -109,7 +197,7 @@
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+ 	}
+-	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	vm_offset_t dwc = ml_io_map(usb_soc->dwc3_pa, usb_soc->dwc3_size);
+ 	if (dwc == 0) {
+ 		printf("SWEET USB: DWC3 map failed\n");
+ 		return;
+@@ -129,7 +217,7 @@
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
+ 	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	vm_offset_t phy = ml_io_map(usb_soc->qusb2_pa, usb_soc->qusb2_size);
+ 	if (phy == 0) {
+ 		return;
+ 	}
