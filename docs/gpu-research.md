@@ -1,684 +1,756 @@
-# GPU acceleration on ios-sweet — feasibility study and groundwork
+# GPU acceleration on ios-sweet: what Apple's closed binaries actually require
 
-**Scope.** Can the MSM8998 (chiron / Mi MIX 2, Adreno 530) or the SM7150 (sweet,
-Adreno 618) give iOS 16 real hardware acceleration, and what is the cheapest
-real win? This document is a hardware-and-software trace, not a driver.
+**Scope.** Is real GPU acceleration reachable on the iPhone-X-userland port, and
+what is the cheapest real win? This is a trace through the closed binaries
+themselves -- Apple's kernelcache and (where reached) the dyld shared cache --
+plus the Qualcomm display driver for the hardware we have.
 
 **Status honesty.** Nothing here was run on a phone, flashed, or compiled into
-the kernel. No GPU driver was written. What *was* done: read the Qualcomm msm-4.4
-driver that drives exactly this hardware on this exact SoC, extract the register
-map for a 2D blit from it, read the XNU side to find where a blit would plug in,
-and rank the possible goals by whether they are possible at all. Every register
-number below is traced to a file and line that I read on the build server.
-Things I could not verify are marked **unverified** or **TODO(unverified)**.
+the kernel. Every hardware address and every API claim is tagged with where it
+comes from -- `read in <file>:<line>`, `disassembled at <addr> with <cmd>`, or
+**unverified**. Where a claim is inferred rather than read, it says so.
+
+**Note on an earlier draft.** A previous pass over this question produced
+`gpu-research-prior-agent.md` (kept alongside this file, unmodified). It was
+written when the dyld shared cache was not on the build server and says so in
+its own text; its Adreno model for chiron ("Adreno 530") is also wrong --
+MSM8998 carries an **Adreno 540**, per the `A540` entries with
+`gpmufw_name = "a540_gpmu.fw2"` in
+`/root/src/kernel_msm8998/drivers/gpu/msm/adreno-gpulist.h:242-262`. Its
+ranking conclusion (MDP blit is the real win, Metal is not) matches -3/-4 here;
+this document adds what the binaries themselves say, which is the part that was
+missing.
 
 ---
 
-## 0. Verdict
+## 0. Top-line verdict
 
-**The GPU (3D) path is a dead end, and not for the reason people usually assume.**
-It is not that writing an Adreno driver is too much work (it is a lot, but it is
-done — freedreno exists). It is that the *client* is Apple's closed Metal/GLES
-stack, whose shader compiler emits machine code for **Apple's own GPU ISA**, and
-whose kernel ABI is Apple's AGX/IOGPU accelerator family. An Adreno 530 cannot
-execute Apple GPU shaders. No amount of kernel work fixes that; you would have to
-also replace the shader compiler inside the unmodified iOS userland, or write an
-AGX→Adreno binary translator. Both are out of scope by orders of magnitude.
+1. **A Metal device object can be faked. A Metal device cannot.** Apple's own
+   kernel spells out the contract in a handful of strings (-2.2) and every one
+   of them can be satisfied by an XNU stub -- until the object is handed to the
+   userspace driver `AGXMetalA11`, which emits **A11/AGX** command streams and
+   **AGX shader binaries**, and expects an A11 GPU that is itself a separate
+   processor running Apple-signed firmware (`AGXFirmwareKextG10PRTBuddy`, -2.2.4).
+   That is not a missing driver; it is a missing processor.
+2. **Faking the device is worse than not faking it**, because the kernel's GPU
+   family has no "present but non-functional" state (-2.3): once `backboardd`
+   has a device it creates a queue and submits. Today `CA::OGL::` reliably picks
+   `CA::OGL::SW` and the home screen draws.
+3. **The real win is 2D hardware composition -- the MDP5 writeback path -- which
+   deletes the per-frame `memcpy` in `AppleCLCD::present()`.** That copy is the
+   only per-frame pixel work the kernel does and it is what forced the port to
+   cap presentation at 10-30 Hz. Bounded, testable, with a clear fallback.
+   -3(c) has the full register table traced to files and lines.
+4. **NEON/multi-core tuning is a 3-5 day band-aid, not a fix**, and the reason
+   is a cache attribute, not arithmetic (-3(d)).
 
-**What *is* real and worth doing:** the display controller's 2D engine (MDSS/MDP)
-can do the copy that `SweetFramebuffer::present()` currently does with `memcpy`,
-and it can scale while doing it. That is genuine hardware acceleration of the
-present path — the copy whose cost forced the port to cap presenting at 10 Hz
-(`SweetFramebuffer.cpp:293-298`). It is a bounded, testable project with a clear
-failure mode (fall back to `memcpy`). It does **not** make the CPU rasteriser
-faster: the UI would still be rasterised on the CPU, just presented by DMA.
-
-**Ranking (details in §3).** Two orders are given because they differ, and
-conflating them is how projects pick the wrong one:
-
-*By pure feasibility:* (d) trivial > (b) possible with real risk > (c) possible
-after (b) > (e) hard > (a) impossible.
-
-*By what actually helps (recommended order of work):*
-
-| rank | approach | feasible? | value |
-|---|---|---|---|
-| **1** | **(b) MDSS/MDP hardware blit for present** | **yes, with real risk** | **high — removes the CPU copy, unblocks 60 Hz present** |
-| 2 | (c) MDP composition + scaling (superset of b) | yes, after (b) | medium-high — fixes chiron's cropped 276 rows |
-| 3 | (d) CPU/NEON tuning of the present path | yes, trivial | very low — the copy is not where the CPU time goes; only useful as (b)'s fallback |
-| 4 | (a) Adreno 5xx + Apple Metal | **no** | — (see §3(a): three independent fatal blockers) |
-| — | (e) *not asked, but the ceiling*: take over scanout (MDP+DSI) so present is zero-copy | very hard | highest, and makes (b)/(c) optional |
-
-(d) ranks first on feasibility and last on usefulness: it is the thing to do only
-if (b) turns out to be blocked by the SMMU (§4.4).
+Ranked, with reasons, in -3. Numbers behind all of it in -1.
 
 ---
 
-## 1. What I could verify here, and what I could not
+## 1. Phase 1 -- the binaries, with sizes before download
 
-**Available on the build server** (`/root/src`, `/root/ios-sweet`):
+### 1.1 Disk and tooling
 
-* `/root/src/kernel_msm8998` — LineageOS `android_kernel_xiaomi_msm8998`
-  (Qualcomm msm-4.4). This is the authoritative register source for MSM8998:
-  `drivers/video/fbdev/msm/` (MDSS/MDP), `drivers/gpu/msm/` (kgsl/Adreno),
-  `arch/arm64/boot/dts/qcom/msm8998*.dtsi` (addresses, clocks, IOMMU),
-  `include/dt-bindings/clock/msm-clocks-hwio-8998.h` (clock register offsets).
-* `/root/src/xnufinal` — the patched XNU tree (patches 0001-0083).
-* `/root/ios-sweet` — project repo, `NOTES.md` (511 lines) with the prior
-  reverse-engineering log, and `tools/devices.py`.
+| item | value |
+|---|---|
+| `df -h /` at start | 49 GiB total, 12 GiB used, **37 GiB available** |
+| `/root/dsc` | did not exist, created |
+| `/root/ios-sweet/research` | existed; only `ipsw-x/` (iPhone10,3.json, `d22ap.adt`, `DeviceTree.d22ap.im4p`) |
+| pre-existing dyld caches | **none** -- `find / -xdev -name 'dyld_shared_cache*'` returned nothing |
+| `ipsw` | absent - installed GitHub release **v3.1.738** (the version NOTES pins), `ipsw_3.1.738_linux_x86_64.deb` - `/root/dsc/bin/x/usr/bin/ipsw` |
+| `llvm-objdump` | absent - `apt install llvm clang`, LLVM 18, `/usr/bin/llvm-objdump` |
 
-**NOT available: the dyld shared cache.** `/root/ios-sweet/research/` contains
-only `ipsw-x/` (the iPhone10,3 `DeviceTree.d22ap` and its JSON), i.e.
-`research/ipsw-x/d22ap.adt` and `research/ipsw-x/dt/DeviceTree.d22ap.im4p`.
-There is **no** `dyld_shared_cache_arm64` anywhere on this machine
-(`find / -iname '*dyld_shared_cache*'` → nothing) and the `ipsw` tool is not
-installed. So **I could not disassemble QuartzCore, IOMobileFramebuffer or
-Metal for this report.**
+Route taken for disassembly: **both**. `ipsw` (v3.1.738, linux x86_64) for the
+dyld-cache side, `llvm-objdump` for the Mach-O carves out of the kernelcache.
+For the kernelcache the image boundaries are **exact, not estimated**: the
+prelinked kext Mach-O headers are found by scanning for `feedfacf` at the
+`_PrelinkExecutableLoadAddr` values declared in the kernelcache's own
+`_PrelinkInfoDictionary`, and each kext's `LC_SEGMENT_64` list gives every
+section's `fileoff`/`size` verbatim (`carve_kext.py`). Confidence: **exact**.
 
-Consequence: everything in §2 about *how* CoreAnimation picks a renderer is
-either (i) quoted from the project's own previously-recorded RE results in
-`NOTES.md` (done on the user's workstation, where the cache lives at
-`research/dsc/dyld_shared_cache_arm64`), or (ii) observed behaviour in the
-port's boot logs, also recorded in `NOTES.md`. Nothing in §2 is my own fresh
-disassembly, and I have flagged which is which.
+### 1.2 The IPSW
 
-Also not available: a macOS/XNU build host. `NOTES.md:62` records that kernel
-compilation happens on a macOS CI runner, not on this Linux server, so the
-skeleton in §6 has **never been compiled**.
+`python3 tools/ipsw.py info`:
 
----
+```
+device    iPhone X (Global) (iPhone10,3)
+board     D22AP  platform t8015  cpid 32789  bdid 6
+version   16.7.16 (20H392)
+size      5.7 GiB (6171035648 bytes)
+sha1      5606c298c1d908f8a48f617f0ceaf71f2a9f0193
+url       https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/
+          1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
+```
 
-## 2. How iOS 16 gets pixels, and what would make it pick a GPU
+`tools/remotezip.py` (HTTP range requests on the zip central directory)
+enumerated **91** members. The relevant ones, **sizes reported before
+downloading**:
 
-### 2.1 The chain that exists today
+| member | bytes | zip method | what it is |
+|---|---:|---|---|
+| `087-86698-044.dmg` | **4 730 814 044** | 0 = stored | **root filesystem**; contains `System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64` + `.01`-`.NN` + `.symbols` |
+| `087-86593-047.dmg` | 2 743 074 816 | 8 = deflate | Cryptex1,SystemOS (the dyld cache is *not* here on 20H392) |
+| `087-86622-047.dmg` | 109 051 931 | 8 | other payload DMG |
+| `087-86719-047.dmg` | 106 954 779 | 8 | RestoreRamDisk |
+| `087-86715-047.dmg` | 10 485 760 | 8 | Cryptex1,AppOS |
+| `kernelcache.release.iphone10b` | **18 204 358** | 8 | kernel + **239 prelinked kexts**, incl. `AGXG10P`, `IOGPUFamily`, `IOMobileGraphicsFamily`, `AGXFirmwareKextG10PRTBuddy` |
+| `BuildManifest.plist` | 449 774 | 8 | build identities and per-component digests |
 
-Established by the port's own logs (`NOTES.md`):
+`remotezip.py` reports `087-86698-044.dmg` `crc = 66ccd39f`, so the pull is
+end-to-end verifiable. Budget check: 4.73 GB of a 37 GiB budget, fine. The CDN
+measured **~4.3 MB/s single-stream** (64 MiB in 14.8 s), so the DMG is pulled
+as a resumable **6-way segmented range download** with exact-length enforcement
+per segment and a final CRC-32 (`dlseg.py`).
 
-1. `backboardd` starts the window server: `MTLSetShaderCachePath`,
-   `[CAWindowServer serverWithOptions:...]`, `setRendererFlags:`, then asks for
-   `mainDisplay` (`NOTES.md:198`, from the crash backtrace of an early boot).
-2. Displays come from **IOMobileFramebuffer kernel services**: `CA::WindowServer`
-   `_detectDisplays` iterates static tables of `AppleCLCDDisplay`,
-   `AppleRGBOutDisplay`, `AppleWirelessDisplay`, each `count()` =
-   `display_count_of_type()` over `IOMobileFramebufferCreateDisplayList()`
-   (`NOTES.md:196`). The port satisfies this with `AppleCLCD :
-   IOMobileFramebuffer` on `/arm-io/disp0` (`SweetFramebuffer.cpp:85-93`,
-   `:199-202`).
-3. Surfaces are IOSurface kernel objects: `IOCoreSurfaceRoot` +
-   `IOSurfaceRootUserClient` (`SweetSurface.cpp`), selectors and traps
-   documented in `NOTES.md:180-186`.
-4. Frames arrive as `SwapEnd` records (0x46c bytes) naming up to 4 IOSurfaces
-   with source/destination rects (`SweetFramebuffer.cpp:14-18`, `:327-345`).
-5. `present()` copies those surfaces into the panel memory with `memcpy`
-   (`SweetFramebuffer.cpp:393-399`), at most every `fFlushTicks` vsyncs, default
-   10 Hz (`:194-197`). The comment at `:293-298` says why: copying 10 MB on
-   every swap at 60 Hz "took the whole CPU".
+**Why the kernelcache first.** It is 1/260th the size and it answers Phase 2
+question 2 outright, because the Metal kernel contract is *declared by Apple's
+kernel* in IOKit personalities, not inferred from userland. `ipsw kernel dec`
+expands it to a 50,937,856-byte Mach-O; `ipsw kernel kexts --json` lists all
+239 kexts. This is the single highest-value 18 MB in the whole IPSW.
 
-### 2.2 What a GPU renderer would require — the evidence
+### 1.3 The dyld shared cache
 
-The decisive observation is in the port's own IOKit trace: with no GPU driver,
-`backboardd` *polls* `IOProviderClass IOAcceleratorES`, and also looks for
-`AGXAccelerator` and `IOAcceleratorESLegacy`, repeatedly, and finds nothing
-(`NOTES.md:162`, `NOTES.md:164`). CA then renders with the CPU rasteriser
-`CA::OGL::SW` — the "Hello" screen and the migration progress bar were drawn this
-way (`NOTES.md:144`, `NOTES.md:161`).
+Lives **only** inside `087-86698-044.dmg` (there is no standalone cache member
+in an iOS 16.7 restore). The DMG is Apple's newer `bvxn` container (magic
+`62 76 78 6e` at offset 0) wrapping an EFI/GPT disk; `ipsw disk dmg <file>`
+lists/extracts partitions and `ipsw mount fs` mounts the HFS+ volume. Per the
+project convention (NOTES.md:223) the cache must live in a **writable**
+directory because `ipsw` writes its `.a2s` address-symbol cache next to it --
+hence `/root/dsc/`, not `/root/ios-sweet/research`.
 
-From the cache RE already on record (`NOTES.md:194-197`, `NOTES.md:234`):
-QuartzCore contains four renderer constructors — `metal_new_context`,
-`gles_new_context`, `sw_new_context` (`CA::OGL::SWContext`), and
-`new_null_context` — plus env knobs `CA_ENABLE_OGL`, `CA_DISPLAY_TYPE`,
-`CA_FORCE_LOCAL_SERVER`, `CA_DISABLE_RENDER`, `CA_ALWAYS_RENDER`. **The exact
-selection logic has never been traced** (`NOTES.md:174` calls it an open
-question; `NOTES.md:195` says "selection logic not traced yet").
-
-So the honest statement of the decision point is:
-
-> CoreAnimation selects a GPU renderer by finding and opening an IOService of
-> Apple's accelerator families (`AGXAccelerator` for Metal,
-> `IOAcceleratorES`/`IOAcceleratorESLegacy` for GLES — the class names observed
-> in the port's trace). With no such service it falls back to the CPU
-> rasteriser. The *only* thing that has been proven is the fallback direction:
-> no service → `CA::OGL::SW`. The exact match list, the properties read, and the
-> user-client ABI behind those families are **unverified** here (no cache on
-> this server).
-
-### 2.3 What a kernel-side stub would have to expose
-
-Minimum to make CA *believe* a GPU exists, in increasing order of difficulty:
-
-1. **A matching IOService.** `IOServiceMatching("IOAcceleratorES")` (or
-   `AGXAccelerator`) must find a registered service, attached where the
-   framework expects it (the accelerator services in iOS live under the
-   platform/`arm-io` subtree; the port already creates `/arm-io` child nubs in
-   `SweetPlatformExpert.cpp`).
-2. **A user client** implementing that family's selector ABI: device
-   information, memory allocation, command-queue submission, completion
-   notification. Undocumented; would have to be re-derived from
-   `IOAcceleratorFamily2`/`IOGPU` binaries in the cache — which are not on this
-   server.
-3. **A GPU that executes Apple's command stream and Apple's shader ISA.**
-   This is the wall. Metal's shaders are compiled *on the device* by Apple's
-   runtime compiler into AGX machine code; the driver's job is to feed that to
-   Apple's GPU. Adreno 5xx/6xx execute a completely different ISA (documented
-   only by reverse engineering, e.g. freedreno). A stub that satisfies (1) and
-   (2) but not (3) produces a device that CA will select and then crash on.
-
-### 2.4 The cheap experiment that would replace guesswork with data
-
-Publish a **decoy** service matching `IOAcceleratorES` (and optionally
-`AGXAccelerator`) with a user client that returns `kIOReturnUnsupported` for
-every selector, behind a boot-arg (so it can be turned off if CA crash-loops),
-with the IOKit trace patch (0049) enabled. One boot then yields: the exact match
-strings, the properties read before `IOServiceOpen`, the open type, and the first
-selectors attempted. That is ~30 lines of code and one boot, and it is the only
-way to learn the ABI without the cache. **Risk:** CA may select GLES and crash;
-gate it and be ready to revert.
-
-Also worth knowing: `IOSurface` has selector `0xc BindAccel` and selectors
-`0x24-0x26`/`0x2d` for `IOSurfaceAccelerator` (`NOTES.md:185`), which the port
-currently accepts and drops. On real hardware that is the *2D* accelerator hook
-(Apple's scaler/format-conversion block). Nothing in the current logs shows CA
-using it, so treat it as a lead, not a plan.
+*This section is completed in -2.1a / -2.3a / -2.4a below if the pull finished;
+if those subsections are headed "not reached", the DMG did not land within the
+session and the QuartzCore/Metal/AGXMetalA11 answers are limited to what -2.2
+can prove from the kernel side.*
 
 ---
 
-## 3. Candidate approaches, ranked
+## 2. Phase 2 -- the closed binaries
 
-Common ground for (b) and (c): the MSM8998 display subsystem is **MDSS** with an
-**MDP** (the "mdp5"-generation block; Qualcomm's fbdev driver, not DRM) at
-`0x0C900000`. Registers in §5. The DSI panel is already being scanned out
-continuously by the boot chain from a fixed physical framebuffer, so the port
-does not need to touch DSI at all for (b)/(c) — it only needs to write pixels
-into that framebuffer with DMA instead of the CPU.
+### 2.0 What was known before this pass (from this repo's own earlier RE)
 
-### (d) Multi-threaded NEON / SIMD CPU rasteriser optimisation — *feasible, nearly worthless*
+NOTES.md:346 (from a previous walk of the cache's `.symbols` subcache):
+QuartzCore has four context constructors -- `metal_new_context`,
+`gles_new_context`, `sw_new_context` (CA::OGL::SWContext) and
+`new_null_context` -- and 249 `CA_*` env variables, among them `CA_ENABLE_OGL`,
+`CA_DISPLAY_TYPE`, `CA_FORCE_LOCAL_SERVER`, `CA_FORCE_TIMER`,
+`CA_CANVAS_WIDTH/HEIGHT`, `CA_MAIN_DISPLAY_SCALE/ORIENTATION`,
+`CA_DISABLE_RENDER`, `CA_ALWAYS_RENDER`.
 
-* **What it would touch:** `SweetFramebuffer.cpp:393-399` (the copy) and the
-  fade-out loop at `:235-241`.
-* **Reality check.** The surface is 10,368,000 bytes (1080x2400x4 = 9.89 MiB);
-  copying it at 60 Hz is 622 MB/s of read traffic plus 622 MB/s of write traffic,
-  against ~29.8 GB/s of LPDDR4X theoretical bandwidth on this SoC class. So the
-  copy is *not* bandwidth-bound — it is a single-threaded, cache-hostile 633-page
-  walk, and my per-frame estimate of 2-5 ms is **inferred, not measured**. What
-  *is* measured (by the port, not by me) is that it was expensive enough to
-  force the present rate down to 10 Hz: "copying 10 MB into the panel on every
-  swap (backboardd presents at 60 Hz) took the whole CPU"
-  (`SweetFramebuffer.cpp:293-298`). Note also that a NEON copy cannot be the
-  real fix, because the CPU time in this system is dominated by **QuartzCore's
-  closed rasteriser**, and we cannot optimise `CA::OGL::SW`'s inner loops at
-  all: it is closed-source ARM64 in the shared cache, and the port explicitly
-  runs the unmodified userland.
-* **The one real lever:** the present rate. `fFlushTicks` was lowered to 10 Hz
-  *because* of the copy cost (`:293-298`), so the UI is capped at 10 fps for a
-  reason that hardware DMA would remove entirely. That is an argument for (b),
-  not for (d).
-* **Effort:** 2-5 days for a NEON copy + row-parallel threads. **Verdict:** only
-  worth it as a fallback path, or as a stopgap if (b) fails.
+NOTES.md:325 records the open question verbatim: *"QuartzCore's IOMFB server
+builds its renderer from Metal first (`CAMetalContextCreate`), GLES only when
+enabled; how the CPU renderer gets selected on a device without a GPU is not
+yet established."*
 
-### (b) Accelerate the copy/present path with the MDP — *the real win, medium risk*
+### 2.1 Renderer selection in QuartzCore
 
-* **Hardware blocks:** MDP (SSPP/DMA pipe → layer mixer → writeback), i.e.
-  DMA1 @ `0x0C928000`, LM1 @ `0x0C947000`, WB @ `0x0C967000`, CTL1 @
-  `0x0C903200`, all inside the MDSS window at `0x0C900000`
-  (derivations in §5). The display keeps scanning out the same physical
-  framebuffer, so nothing about the panel changes.
-* **Where the registers are documented:** Qualcomm's GPL driver —
-  `drivers/video/fbdev/msm/mdss_mdp_hwio.h` (block-internal offsets),
-  `mdss_mdp_intf_writeback.c` (WB programming), `mdss_mdp_pipe.c` (source pipe
-  programming), `mdss_mdp_ctl.c` (CTL/LAYER/FLUSH/START and the pipe→stage
-  encoding table), `mdss_mdp_formats.h` (pixel-format encoding),
-  `msm8998-mdss.dtsi` (block bases, IRQ, clocks). Full table in §5.
-* **What it buys:** the 10.4 MB/frame CPU copy disappears; present can go back
-  to 60 Hz for ~0 CPU; the vsync workloop stops being a bottleneck; the fade-out
-  can become a hardware constant-alpha blend (or just keep the CPU loop).
-* **Minimum viable implementation:** the skeleton in §6 — one kickoff,
-  poll-for-completion, `memcpy` fallback on timeout.
-* **The real risk, stated plainly:** the MDP is a **bus master behind the MMSS
-  SMMU** (`mmss_smmu: arm,smmu-mmss@cd00000`, `msm-arm-smmu-8998.dtsi:98-101`;
-  MDSS's context-bank children at `msm8998-mdss.dtsi:233-259`). XNU has **no
-  IOMMU support at all**: `osfmk/arm/pmap/pmap_iommu.c` is a 33-line
-  "Placeholder for pmap IOMMU functionality", and there is no SMMU driver in
-  `iokit/`. Therefore the MDP can only be pointed at **physical** addresses, and
-  only if the SMMU is left unprogrammed (bypass). Evidence that this is the
-  boot state: the Linux driver deliberately does *not* attach the SMMU during
-  the continuous-splash handoff because it "may still be working with phys
-  addr" (`mdss_mdp.c:1521-1526`) — i.e. the bootloader's splash runs with
-  physical addresses. **unverified on our hardware**: whether the UEFI chain
-  leaves the SMMU in that state on chiron. `edk2-msm8998` contains no SMMU code
-  (`grep -ril smmu` over the tree → nothing), which is consistent with "never
-  programmed", but absence of code is not proof of bypass.
-* **Second real risk:** the source surfaces are *not* physically contiguous.
-  `SweetSurface` allocates pixels with
-  `IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut |
-  kIOMemoryKernelUserShared, allocSize, page_size)` (`SweetSurface.cpp:691-692`)
-  — page-based, no contiguity guarantee. Fix is in our own code (we own the
-  allocator): allocate with `kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone`
-  and fall back to the CPU copy if the ~10.4 MB allocation fails. Note the
-  subtlety in `IOBufferMemoryDescriptor.cpp:302-326`: a contiguous kheap
-  allocation (`IOKernelAllocateWithPhysicalRestrict`, `:326`) is only taken when
-  `contig` is set, and `kIOMemoryPhysicallyContiguous` sets it only when the
-  descriptor is *not* using the default mapper (`:304-306`:
-  `contig |= (!mapped); contig |= (kIOMemoryMapperNone & options);`) — hence the
-  explicit `kIOMemoryMapperNone`.
-* **Effort:** 2-4 weeks to a *proven* blit (power/clock sequencing, timeouts,
-  fallback), 6-8 weeks to something you would leave enabled (tearing, vsync
-  alignment, error recovery).
+#### 2.1a Direct disassembly
 
-### (c) MDP 2D composition + scaling — *the superset, do it after (b)*
+See the subsection with this heading at the end of the document (-7), which is
+filled in from the extracted cache.
 
-* Same block as (b), plus the **VIG** pipes (`0x5000/0x7000/0x9000/0xB000`,
-  `msm8998-mdss.dtsi:67`) which carry the QSEED scaler
-  (`MDSS_MDP_REG_VIG_QSEED2_*` / `MDSS_MDP_REG_SCALER_*`,
-  `mdss_mdp_hwio.h:306-344`; phase-step registers at `0x210/0x214` and init
-  phase at `0x220/0x224`), and the swap record already carries up to 4 layers
-  with independent `a`/`b` rects (`SweetFramebuffer.cpp:327-345`), so the ABI to
-  composite several layers already exists.
-* **Concrete user-visible win on chiron:** the port presents a 1125x2436
-  logical screen into a 1080x2160 panel by *cropping* — `test-board-header`
-  shows "panel shows y 0..2159 (top-aligned, 276 rows off-panel)"
-  (`notes-handoff.md:47-52`). With the MDP scaler the same content can be
-  scaled to fit instead of losing 276 rows.
-* **Effort:** +2-4 weeks over (b). Scaling brings its own register surface
-  (phase steps, coefficient RAM, decimation limits) and the VIG pipe's QSEED
-  version for this MDP revision is **unverified** (`mdss_mdp_hwio.h` carries both
-  QSEED2 and QSEED3 register sets; which one this MDP uses depends on
-  `mdata->mdp_rev`, read from `MDSS_REG_HW_VERSION` at runtime —
-  `mdss_mdp.c:2249-2255`).
+### 2.2 The kernel-side contract for a Metal device -- **read straight out of Apple's kernel**
 
-### (a) Adreno 5xx driver in XNU + Apple's Metal — **dead end**
+This is the load-bearing result and it needs no userland binary: Apple's kernel
+declares, in IOKit personality dictionaries, exactly what a GPU must be.
 
-Three independent blockers, any one of which is fatal:
+#### 2.2.1 The personality that *is* the contract
 
-1. **ISA mismatch (fatal, unfixable in the kernel).** iOS Metal shaders are
-   compiled on-device by Apple's closed compiler to Apple-GPU (AGX) machine
-   code. Adreno 5xx has a different ISA. A kernel driver cannot change what the
-   userland compiler emits. Fixing this means replacing Metal's compiler inside
-   the unmodified userland, or writing an AGX→Adreno translator.
-2. **Closed kernel ABI.** The accelerator user-client ABI (the family CA and
-   Metal open) is undocumented and not on this machine to reverse. Even a
-   perfect Adreno driver would be invisible to Apple's stack.
-3. **Signed firmware / TrustZone.** The Adreno 530 will not start without
-   Qualcomm's signed microcode: `a530_pm4.fw`, `a530_pfp.fw`,
-   `a530_zap`, `a530_gpmu.fw2`/`a530v3_gpmu.fw2`, `a530v2_seq.fw2`
-   (`adreno-gpulist.h:158-172` for patchid 1, `:183-189` for the ANY_ID entry,
-   `:142-143` for the v1 entry). The zap shader is loaded through
-   PIL and the driver *aborts* if it fails: `zap_handle_ptr =
-   subsystem_get(adreno_dev->gpucore->zap_name); ... if (IS_ERR_OR_NULL(...))
-   return -ENODEV` (`adreno_a5xx.c:2278-2286`). That path authenticates through
-   the secure world (`scm_call2*`, e.g. `adreno.c:2741-2748`). XNU in this port
-   has no TrustZone/SCM client, and the images are signed for Qualcomm's keys —
-   you cannot substitute your own.
-   GPU base/IRQ for reference: `qcom,kgsl-3d0@5000000`, 0x40000, SPI 300
-   (`msm8998-gpu.dtsi:52-59`), chipid `0x05040000` (`:62`), GPU MMU at
-   `0x05040000`+0x10000 (`:248-252`), GPUCC at `0x5065000` (`msm8998.dtsi:973`).
-* **If someone insisted anyway:** a freedreno-class Adreno bring-up under XNU
-  (power/clock/CP/ringbuffer/IOMMU, no Apple userland support) is a
-  6-12 person-month project with zero effect on the iOS UI, because of (1) and
-  (2). **Do not spend time here.**
+Source: `_PrelinkInfoDictionary` in the decompressed kernelcache. The plist
+blob starts at file offset `0x8a976` and ends at `0x9d7c81`; the `AGXG10P`
+record starts at `0x2e81d54`. Copied verbatim into
+`/root/dsc/out/agxg10p-personalities.xml`. Reformatted only for width:
 
-### (e) The actual ceiling (not asked, but it is where (b)/(c) lead)
+```
+AGXG10P_B0 = {
+    CFBundleIdentifier = com.apple.AGXG10P
+    IOMatchCategory    = IOAcceleratorES
+    IOClass            = AGXAcceleratorG10P_B0
+    IOProviderClass    = AppleARMIODevice
+    IONameMatch        = ( "gpu,t8015" )
+    IOGLESBundleName   = AppleMetalGLRenderer
+    MetalPluginName    = AGXMetalA11
+    IOSourceVersion    = 371
+}
 
-Take over **scanout** — program VIG0→LM0→INTF0→DSI0 yourself and point it at the
-compositor's surface — and present becomes zero-copy and tear-free. That needs
-the DSI PHY/PLL and the panel's init sequence from the device tree, i.e. weeks to
-months, and a panel-timing mistake bricks the display until reflash. (b) and (c)
-are the sane steps that make (e) optional rather than necessary.
-
----
-
-## 4. MSM8998 display/GPU hardware facts (all traced)
-
-### 4.1 Addresses
-
-| block | address | length | source |
-|---|---|---|---|
-| MDSS top + MDP | `0x0C900000` | `0x90000` | `msm8998-mdss.dtsi:17` |
-| MDP register window | `0x0C900000 + 0x1000` | — | `msm8998-mdss.dtsi:58` (`qcom,mdss-mdp-reg-offset`) |
-| VBIF | `0x0C9B0000` | `0x1040` | `msm8998-mdss.dtsi:17-19` |
-| MDP interrupt | GIC SPI 83 | — | `msm8998-mdss.dtsi:20` |
-| MMSS clock controller | `0x0C8C0000` | `0x40000` | `msm8998.dtsi:948-950` |
-| MDSS GDSC (power) | `0x0C8C2304` | 4 | `msm-gdsc-8998.dtsi:116` |
-| MMSS SMMU | `0x0CD00000` | `0x40000` | `msm-arm-smmu-8998.dtsi:98-101` |
-| Adreno 530 (kgsl-3d0) | `0x05000000` | `0x40000` | `msm8998-gpu.dtsi:52-57` |
-| Adreno GPU MMU | `0x05040000` | `0x10000` | `msm8998-gpu.dtsi:248-252` |
-| GPU clock controller | `0x05065000` | — | `msm8998.dtsi:973-974` |
-
-### 4.2 Block offsets inside the MDP window (`msm8998-mdss.dtsi`)
-
-| block | offsets | line |
-|---|---|---|
-| CTL0..CTL4 | `0x2000 0x2200 0x2400 0x2600 0x2800` | `:91` |
-| VIG0..VIG3 (scaling pipes) | `0x5000 0x7000 0x9000 0xB000` | `:67` |
-| DMA0..DMA3 (no scaler) | `0x25000 0x27000 0x29000 0x2B000` | `:69` |
-| CURSOR0/1 | `0x35000 0x37000` | `:71` |
-| LM0..LM3 (layer mixers) | `0x45000 0x46000 0x47000 0x4A000` | `:93` |
-| DSPP0/1 | `0x55000 0x57000` | `:95` |
-| WB (named "WB_2") | `0x66000` | `:96`, name at `:200` |
-| INTF0..INTF3 | `0x6B000 0x6B800 0x6C000 0x6C800` | `:97` |
-| PingPong0..3 | `0x71000 0x71800 0x72000 0x72800` | `:99` |
-| Dest scaler | `0x61000` (block), scalers `+0x800`, `+0x1000` | `:227-229` |
-
-XIN ids (VBIF clients): VIG `0 4 8 12`, DMA `1 5 9 13`, CURSOR `2 10`
-(`msm8998-mdss.dtsi:73-75`).
-
-### 4.3 Clocks and power (what must be on before *any* register works)
-
-* Clocks: `mnoc_clk, iface_clk, bus_clk, core_clk_src, core_clk, vsync_clk,
-  lut_clk` (`msm8998-mdss.dtsi:116-125`).
-* Bounds: `qcom,max-clk-rate = <412500000>` (`msm8998-mdss.dtsi:62`),
-  `qcom,max-mixer-width = <2560>` / `max-pipe-width` (`:40-41`).
-* Their MMSS-CC branch registers (`include/dt-bindings/clock/msm-clocks-hwio-8998.h`):
-  `MMSS_MDSS_AHB_CBCR 0x2308` (`:354`), `MMSS_MDSS_AXI_CBCR 0x2310` (`:355`),
-  `MMSS_MDSS_MDP_CBCR 0x231C` (`:373`), `MMSS_MDSS_MDP_LUT_CBCR 0x2320`
-  (`:374`), `MMSS_MDSS_VSYNC_CBCR 0x2328` (`:378`), `MMSS_MDSS_ROT_CBCR 0x2350`
-  (`:377`), source RCG `MMSS_MDP_CMD_RCGR 0x2040` (`:259`).
-  Branch enable = **bit 0** of the CBCR (`clock-local2.c:68`
-  `#define CBCR_BRANCH_ENABLE_BIT BIT(0)`). The halt/ack bit is **unverified**.
-* GDSC: power-on is **bit 31** (`gdsc.c:29 #define PWR_ON_MASK BIT(31)`), status
-  is polled with `udelay(1)` (`gdsc.c:87-118`); the status bit position is
-  **unverified** (do not guess it — read `gdsc.c` or dump the register on a
-  working boot).
-* `qcom,mdp-settings` (a table the Linux driver writes at init,
-  `msm8998-mdss.dtsi:127-145`) includes `0x01190 <- 0`, `0x012ac <- 0xc0000ccc`,
-  `0x012b4 <- 0xc0000ccc`, `0x012bc <- 0x00cccccc` (`:130`),
-  `0x012c4 <- 0x0000cccc`, `0x013a8 <- 0x0cccc0c0`, `0x013b0 <- 0xccccc0c0`,
-  `0x013b8 <- 0xcccc0000`, `0x013d0 <- 0x00cc0000`, and `0x?06c <- 0` for each
-  pipe.
-  **These are not optional**: they ungated the per-pipe AXI clock fields. XNU
-  must replay them. (Offsets in this table are relative to the MDSS base, i.e.
-  `0x1000` higher than the same register's offset inside the MDP window —
-  compare `0x012bc` here with `ctx->clk_ctrl.reg_off = 0x2BC`,
-  `mdss_mdp_intf_writeback.c:101`.)
-* Panel/DSI are **not** needed for (b)/(c): the boot chain leaves DSI0 scanning
-  out the splash framebuffer, and the port writes into that same memory today
-  (`SweetFramebuffer.cpp:161-165`, `fPhys` from `PE_current_console`).
-
-### 4.4 The SMMU question (the one that decides feasibility)
-
-* MDSS's streaming master goes through `mmss_smmu`; the MDP has *no* `iommus`
-  property of its own — instead two context-bank child nodes
-  `qcom,smmu_mdp_unsec_cb` (stream 0) and `qcom,smmu_mdp_sec_cb` (stream 1)
-  (`msm8998-mdss.dtsi:233-259`), and the rotator has its own
-  (`:610-637`, streams `0xe00`/`0xe01`).
-* XNU has no IOMMU driver: `osfmk/arm/pmap/pmap_iommu.c` is a placeholder
-  ("Eventually all code relating to the IOMMU extensions will be placed into
-  this file", 33 lines total). `iokit/` has no SMMU/DART driver.
-* The boot state is bypass/no-translation: the Linux driver defers its SMMU
-  attach until the continuous splash handoff completes, because the splash "may
-  still be working with phys addr" (`mdss_mdp.c:1521-1526`).
-* ⇒ **A blit is only possible with physical addresses, and only if the SMMU
-  stays unprogrammed.** This must be *measured* on chiron before writing any
-  driver code (§8).
-
----
-
-## 5. MDSS/MDP 2D blit register map
-
-This is the concrete table a kernel driver would use. Path:
-**DMA1 (source, linear BGRA8888) → LM1 (stage 0, opaque) → WB (linear
-BGRA8888)**, kicked by **CTL1** in writeback mode. All offsets inside a block are
-from `mdss_mdp_hwio.h`; the block bases are from `msm8998-mdss.dtsi`.
-
-### 5.1 Absolute addresses for this path
-
-| register block | absolute base | derivation |
-|---|---|---|
-| MDP window | `0x0C901000` | `0x0C900000 + 0x1000` (`msm8998-mdss.dtsi:17,58`) |
-| CTL1 | `0x0C903200` | `+0x2200` (`:91`) |
-| DMA1 | `0x0C928000` | `+0x27000` (`:69`) |
-| LM1 | `0x0C947000` | `+0x46000` (`:93`) |
-| WB | `0x0C967000` | `+0x66000` (`:96`) |
-| MDP INTR_STATUS | `0x0C901014` | `+0x14` (`hwio.h:67`) |
-| MDP INTR_CLEAR | `0x0C901018` | `+0x18` (`hwio.h:68`) |
-| MDP HW_VERSION | `0x0C900000` | `hwio.h:61` (MDSS-relative) |
-
-### 5.2 Source pipe (DMA1) — offsets in the DMA1 block
-
-| off | register | value for a BGRA8888 copy | source |
-|---|---|---|---|
-| `0x000` | `SSPP_SRC_SIZE` | `(h<<16)\|w` | `hwio.h:241` |
-| `0x008` | `SSPP_SRC_XY` | `(src_y<<16)\|src_x` | `hwio.h:243` |
-| `0x00C` | `SSPP_OUT_SIZE` | `(h<<16)\|w` | `hwio.h:244` |
-| `0x010` | `SSPP_OUT_XY` | `0` | `hwio.h:245` |
-| `0x014` | `SSPP_SRC0_ADDR` | `src_phys + y*stride + x*4` | `hwio.h:246`; write site `mdss_mdp_pipe.c:2283` |
-| `0x024` | `SSPP_SRC_YSTRIDE0` | `src_stride` in `[15:0]` | `hwio.h:250`; `mdss_mdp_pipe.c:1914` |
-| `0x028` | `SSPP_SRC_YSTRIDE1` | `0` | `hwio.h:251`; `mdss_mdp_pipe.c:1915` |
-| `0x030` | `SSPP_SRC_FORMAT` | **`0x000236FF`** (derived) | `hwio.h:253`; encoding `mdss_mdp_pipe.c:2123-2155` |
-| `0x034` | `SSPP_SRC_UNPACK_PATTERN` | **`0x03020001`** | `hwio.h:254`; `mdss_mdp_pipe.c:2140-2141` |
-| `0x038` | `SSPP_SRC_OP_MODE` | `0` (no flip/scale) | `hwio.h:255`; `mdss_mdp_pipe.c:2178` |
-| `0x048` | `SSPP_FETCH_CONFIG` | **do not write** for linear formats | `mdss_mdp_pipe.c:2158-2168` |
-
-**How `SRC_FORMAT = 0x236FF` is derived** (this is arithmetic on the driver's own
-code + its own format table, not a value read off hardware):
-
-* `MDP_BGRA_8888` → `FMT_RGB_8888(..., alpha_en=1, e0=C1_B_Cb, e1=C0_G_Y,
-  e2=C2_R_Cr, e3=C3_ALPHA)` (`mdss_mdp_formats.h:320-322`).
-* `FMT_RGB_8888` gives `fetch_planes=INTERLEAVED(0)`, `unpack_tight=1`,
-  `unpack_align_msb=0`, `unpack_count=4`, `bpp=4`, all four channels
-  `COLOR_8BIT=3` (`mdss_mdp_formats.h:75-94`; enum at `:25-32`).
-* Encoding (`mdss_mdp_pipe.c:2123-2155`):
-  `(chroma<<23)|(planes<<19)|(b3<<6)|(b2<<4)|(b1<<2)|(b0<<0) | ((count-1)<<12)
-  | (tight<<17) | (align<<18) | ((bpp-1)<<9)`
-  = `0xFF | 0x3000 | 0x20000 | 0x600` = **`0x000236FF`**
-  (channel bits `0xC0|0x30|0xC|0x3 = 0xFF`; `count-1` → `0x3000`;
-  `tight` → `0x20000`; `bpp-1` → `0x600`).
-
-These constants are **machine-checked**, not hand-arithmetic: a standalone C
-program re-implements the two encoding functions from `mdss_mdp_pipe.c:2123-2155`
-and `mdss_mdp_intf_writeback.c:444-479`, applies them to the `MDP_BGRA_8888`
-entry, and asserts the results (`SRC 0x236FF`, `DST 0x237FF`,
-`PATTERN 0x03020001`, `CTL_FLUSH 0x11200`). My first hand-computed values were
-wrong in four places; the assertions caught them. Anyone re-deriving these should
-run the same check rather than trust the table.
-
-### 5.3 Destination — WB block
-
-| off | register | value | source |
-|---|---|---|---|
-| `0x000` | `WB_DST_FORMAT` | **`0x000237FF`** (= src format + `BIT(8)` DSTC3_EN) | `hwio.h:520`; encoding `mdss_mdp_intf_writeback.c:444-479` |
-| `0x004` | `WB_DST_OP_MODE` | **`0`** for a plain line-mode blit | `hwio.h:521`; set from `ctx->opmode`, which `mdss_mdp_writeback_prepare_wfd()` zeroes (`intf_writeback.c:636`) |
-| `0x008` | `WB_DST_PACK_PATTERN` | `0x03020001` | `hwio.h:522`; `intf_writeback.c:468-471` |
-| `0x00C` | `WB_DST0_ADDR` | `dst_phys + y*stride + x*4` | `hwio.h:523`; `intf_writeback.c:242` |
-| `0x01C` | `WB_DST_YSTRIDE0` | `dst_stride` | `hwio.h:527`; `intf_writeback.c:506` |
-| `0x074` | `WB_OUT_SIZE` | `(h<<16)\|w` | `hwio.h:542`; `intf_writeback.c:485,508` |
-| `0x078` | `WB_ALPHA_X_VALUE` | `0xFF` | `hwio.h:543`; `intf_writeback.c:502` |
-| `0x2B0` | `WB_DST_ADDR_SW_STATUS` | `0` for non-secure | `hwio.h:549`; `intf_writeback.c:1054` |
-
-**Trap worth stating explicitly — there are two different "opmode" registers and
-they do not hold the same value.** `mdata`-level `CTL_TOP` receives
-`ctl->opmode` (`mdss_mdp_ctl.c:5887`), which for a writeback session is
-`MDSS_MDP_CTL_OP_WB0_MODE` = `0x3` (`hwio.h:200`), chosen by
-`mdss_mdp_wfd_setup()` from the *mixer* number (`mdss_mdp_wfd.c:259-266`). The
-writeback block's own `WB_DST_OP_MODE` receives `ctx->opmode`, which for the
-line/wfd path is explicitly **0** (`intf_writeback.c:636`) — the CSC/BWC/rotation
-bits are only OR-ed in for YUV or UBWC or the rotator
-(`intf_writeback.c:423-442`, `:487-494`, `:690-712`). Writing `0x3` into
-`WB_DST_OP_MODE` (as my first draft of the skeleton did) would be wrong.
-
-Write order used by the driver: alpha, format, opmode, pattern, strides,
-out_size, write_config (`intf_writeback.c:502-509`).
-
-### 5.4 Layer mixer (LM1)
-
-| off | register | value | source |
-|---|---|---|---|
-| `0x000` | `LM_OP_MODE` | `0` (+ per-stage "keep fg alpha" bits in normal use) | `hwio.h:457`; `mdss_mdp_ctl.c:5198` |
-| `0x004` | `LM_OUT_SIZE` | `(h<<16)\|w` | `hwio.h:458`; `mdss_mdp_ctl.c:5055` |
-| `0x008` | `LM_BORDER_COLOR_0` | `0` | `hwio.h:459`; `mdss_mdp_ctl.c:5200` |
-| `0x010` | `LM_BORDER_COLOR_1` | `0` | `hwio.h:460`; `mdss_mdp_ctl.c:5202` |
-| `0x20 + 0x30*stage + 0x00` | `LM_BLEND_OP(stage)` | `FG_ALPHA_FG_CONST \| BG_ALPHA_BG_CONST` = `0x00000100` (opaque) | `hwio.h:462-463`; `mdss_mdp_ctl.c:5115-5116`; bits `hwio.h:494,503` |
-| `0x20 + 0x30*stage + 0x04` | `LM_BLEND_FG_ALPHA` | `0xFF` | `hwio.h:464`; `ctrl.c:5179` |
-| `0x20 + 0x30*stage + 0x08` | `LM_BLEND_BG_ALPHA` | `0x00` | `hwio.h:465`; `mdss_mdp_ctl.c:5181` |
-| `0x150` | `LM_BLEND_STAGE4` (extra stages) | — | `hwio.h:474`; `mdss_mdp_ctl.c:5103-5104` |
-
-`stage` is the blend-stage ordinal; the driver shifts later stages by
-`LM_BLEND_STAGE4` for `stage > 3` (`mdss_mdp_ctl.c:5103-5104`). **Which ordinal
-the first pipe lands on is unverified here** — see §5.6.
-
-### 5.5 Control block (CTL1): binding, flush, kickoff
-
-| off | register | value | source |
-|---|---|---|---|
-| `0x00C` | `CTL_LAYER(3)` | `2 << 21` (DMA1 at stage 0) **unverified variant**, see §5.6 | `hwio.h:180-181`; encoding `mdss_mdp_ctl.c:46-61` + `:4823-4847` |
-| `0x014` | `CTL_TOP` | `0x3` (writeback mode) | `hwio.h:189`, `hwio.h:200`; write `mdss_mdp_ctl.c:5887`; value chosen at `mdss_mdp_wfd.c:259-266` |
-| `0x018` | `CTL_FLUSH` | `BIT(12) \| BIT(6+3) \| BIT(16)` = `0x00011200` | `hwio.h:190`; pipe bit `mdss_mdp_ctl.c:5446`, LM bit `:5189`, WB bit `intf_writeback.c:1053` |
-| `0x01C` | `CTL_START` | `1` | `hwio.h:191`; `intf_writeback.c:1069` |
-
-Completion: `MDP_INTR_STATUS` bit 4 = `MDSS_MDP_INTR_WB_2_DONE`
-(`mdss_mdp_hwio.h:95`), cleared via `MDP_INTR_CLEAR` (`hwio.h:68`). The Linux
-driver instead enables the WB interrupt (`intf_writeback.c:1049-1059`) and
-sleeps on a completion (`:922-999`); XNU has no MDSS interrupt handler yet, so
-polling is the minimum viable approach.
-
-### 5.6 What is still unverified in this table
-
-Stated explicitly so nobody mistakes the table for a working driver:
-
-1. **Which `CTL_LAYER<n>` register the writeback mixer uses.**
-   `mdss_mdp_ctl.c:4863-4870` documents "INTF: 0,1,2,5 / WB: 3,4", and
-   `mdss_mdp_ctl.c:4875-4884` picks hw mixer 1 or 3 depending on
-   `MDSS_CAPS_MIXER_1_FOR_WB`. Which applies to this MDP revision is not
-   determined here. Note the coupling: `CTL_TOP = 0x3` (WB0 mode) is only
-   correct if the assigned mixer reported `MDSS_MDP_WB_LAYERMIXER0`
-   (`mdss_mdp_wfd.c:259-266`); the register number and the CTL_TOP value must
-   be chosen together.
-2. **The blend stage ordinal** for a single pipe, and the exact `LM_OP_MODE`
-   bits the driver sets for an opaque stage (`mdss_mdp_ctl.c:5110`, `:5166-5167`).
-3. **VBIF / QoS / danger-safe LUTs** were not programmed in §5. The driver sets
-   them from DT (`qcom,mdss-vbif-qos-*`, `mdss_mdp_intf_writeback.c:170-196`);
-   defaults may or may not cause underruns at 1080p.
-4. **The GDSC status bit** and the **clock halt bit** (§4.3).
-5. **Whether the SMMU is really in bypass** (§4.4).
-
-The cheapest way to resolve 1, 2, 3 and 5 is not more reading — it is a register
-dump from a working Android boot on the same phone (§8).
-
----
-
-## 6. The skeleton
-
-`/root/mdss-blit-skeleton.c` (also `E:\ios-sweat\artifacts\gpu\mdss-blit-skeleton.c`)
-implements exactly the table in §5: power on GDSC, ungate the five clocks, replay
-`MDP_CLK_CTRL`, program DMA1 → LM1 → WB, kick CTL1, poll `INTR_STATUS`. It is
-**not wired in, not compiled, and not tested**; every uncertain spot carries a
-`TODO(unverified)` comment rather than a guess.
-
-The only three XNU APIs it calls were checked to exist in this tree:
-`IODelay(unsigned)` (`iokit/IOKit/IOLib.h:590`),
-`kIODirectionOutIn` (`iokit/IOKit/IOMemoryDescriptor.h:64`) and
-`IOMemoryDescriptor::withPhysicalAddress()` (`:519`). Everything else is
-`volatile uint32_t *` accesses plus arithmetic, so the register logic is directly
-reviewable even though it cannot be built on this Linux host.
-
-**How it would replace the `memcpy`.** Today, per layer
-(`SweetFramebuffer.cpp:393-399`):
-
-```c
-if (src != 0 && bpe == 4) {
-        for (int32_t y = 0; y < h; y++) {
-                memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes +
-                    (uint64_t)dx * 4),
-                    (const void *)(src + s->offset +
-                    (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
-                    (size_t)w * 4);
-        }
+AGXG10P_A0 = {                    /* the other A11 chip revision */
+    CFBundleIdentifier = com.apple.AGXG10P
+    IOMatchCategory    = IOAcceleratorES
+    IOClass            = AGXAcceleratorG10P_A0
+    IOProviderClass    = AppleARMIODevice
+    IONameMatch        = ( "gpu,t8015" )
+    IOGLESBundleName   = AppleMetalGLRenderer
+    MetalPluginName    = AGXMetalG10A0
 }
 ```
 
-becomes one call:
+So an `IOService` that Apple's Metal stack will adopt must satisfy **all** of:
 
-```c
-sweet_mdss_blit(&g_mdss,
-    src_phys_of(s) + s->offset, s->bytesPerRow, sx, sy,
-    fPhys,                      fRowBytes,       dx, dy, w, h);
+| # | requirement | value |
+|---|---|---|
+| 1 | provider class | `AppleARMIODevice` -- an `/arm-io` child nub, not an arbitrary service |
+| 2 | `IONameMatch` (device-tree `compatible`/`name`) | **`gpu,t8015`** -- the A11 identifier, matched exactly |
+| 3 | `IOMatchCategory` | **`IOAcceleratorES`** (note: *ES*, not plain `IOAccelerator`) |
+| 4 | `IOClass` | a subclass of `AGXAccelerator` (`AGXAcceleratorG10P_A0/B0`), which is itself an `IOGPU` subclass from `com.apple.iokit.IOGPUFamily` 65.60.1 |
+| 5 | registry properties | `MetalPluginName` = `AGXMetalA11`, `IOGLESBundleName` = `AppleMetalGLRenderer` |
+
+**Names that do *not* exist**, checked by exhaustive string search over the
+50.9 MB kernelcache: `gpu-core-count` - **0 hits**; `IOGLBundleName` - **0
+hits** (the real key is `IOGLESBundleName`); `MetalPluginClassName` - present,
+but in the **AGX binary's** `__cstring` (kernelcache file offset `0x1108010`),
+not in a personality dict. Any stub sketched against `gpu-core-count` or
+`IOGLBundleName` is sketched against names that are not in this build.
+
+#### 2.2.2 What userland instantiates, as seen from the kernel side
+
+From `AGXG10P.__TEXT.__cstring` (56 strings + all C++ type encodings, saved as
+`/root/dsc/out/agxg10p-cstring.txt`):
+
+| string | meaning |
+|---|---|
+| `MetalPluginClassName` | key the accelerator exposes to userland |
+| `AGXA11Device` | the class userland instantiates for this device |
+| `MetalStatisticsName` - `AGXMetalStatisticsExternalA11` | statistics bundle |
+| `AGXGPURawCounterBundleName` - `AGXGPURawCounterBundle` | perf-counter plugin |
+| `GPURawCounterPluginClassName` - `AGXGPURawCounterSourceGroup` | ditto |
+| `AGXFirmwareKextName` - `AGXFirmwareKextG10PRTBuddy` | **the firmware kext** |
+| `com.apple.private.agx.performance-spi`, `com.apple.internal.display-params-access-privileged`, `com.apple.agx.restartreport` | entitlements / report nub |
+
+From `IOGPUFamily.__TEXT.__cstring` (at `0xfffffff005544ae8`, 0x3f7c bytes,
+saved as `iogpufamily-cstring.txt`) -- these are the
+`IOExternalMethodDispatch` handler names of `IOGPUDeviceUserClient`, i.e. the
+**command-submission ABI**:
+
+```
+s_new_command_queue        s_delete_command_queue      s_new_resource
+s_submit_command_buffers   s_create_io_command_queue   s_destroy_io_command_queue
+s_set_io_notification_queue s_submit_io_commands       s_create_io_command_buffer
+s_destroy_io_command_buffer s_try_cancel_io_command_buffer
+s_perform_io               s_io_command_buffer_complete
+s_io_command_buffer_barrier_complete                    s_create_vniodesc
+s_async_signal_mtlLateEvalevent                         s_query_mtlLateEvalevent
 ```
 
-with `memcpy` retained as the fallback when the blit times out or the surface is
-not contiguous. Three things make this safe to try:
+Kernel command opcodes inside a submitted buffer (`kIOGPUKernelCommand-`):
 
-* the destination is already a fixed physical window (`fPhys`, `:162`), so
-  nothing about scanout changes;
-* the interface (`present(const uint8_t *rec)`) and the swap record are
-  untouched;
-* failure is observable (timeout + `CTL_START` readback) and recoverable.
+```
+kIOGPUKernelCommandDebugLog          kIOGPUKernelCommandCollectTimeStamp
+kIOGPUKernelCommandSignalSharedEvent kIOGPUKernelCommandWaitSharedEvent
+kIOGPUKernelCommandPurgeResources    kIOGPUKernelCommandSetProtectionOptions
+```
 
-**The one thing that must be solved first** is `src_phys_of(s)`: surfaces are
-page-allocated today (`SweetSurface.cpp:691-692`). Since the port owns the
-surface allocator, the fix is a flag change plus a fallback, but the 10.4 MB
-contiguity has to be *measured* (§8, step 3).
+and the structures it validates byte-by-byte -- `sIOGPUKernelCommand`,
+`sIOGPUKernelArgs`, `sIOGPUKernelCommandBarrierArgs`,
+`sIOGPUKernelCommandSignalOrWaitEventArgs`, `sIOGPUKernelCommandDebugLogArgs`,
+`sIOGPUKernelCommandCollectTimeStampArgs`,
+`sIOGPUKernelCommandPurgeResourcesArgs`,
+`sIOGPUKernelCommandSetProtectionOptionsArgs` -- with error strings that state
+the layout rules outright (from `IOGPUFamily.__TEXT.__os_log`, 244 format
+strings saved as `iogpufamily-oslog.txt`):
+
+```
+"%s: Insufficient bytes (%lu) to hold sIOGPUKernelCommand (%lu)"
+"%s: Invalid command list header, commands_start=%u commands_end=%u cmdListShmemLength=%ld"
+"%s: kernelCommandBufferShmem (PID=%d) failed to map into kernel"
+"%s: segmentListShmem (PID=%d) failed to map into kernel"
+"%s: sidebandBufferShmem (PID=%d) failed to map into kernel"
+"%s: Invalid eIOGPUKernelCommands enum (command_id=%u command_size=%llubytes)"
+"%s: Invalid Descriptor Type (%u)"
+"%s: Invalid IO Queue Type (%u)"
+```
+
+So submission is **not** one struct per command buffer: userland hands the
+kernel **three shared-memory segments** (kernel command buffer, segment list,
+sideband buffer) plus a command list delimited by `commands_start`/
+`commands_end`, and the kernel walks it, mapping each referenced shmem.
+
+The per-command record `IOGPUCommandDescriptor` is recoverable in full from the
+encoded type string that AGX itself prints (it appears verbatim in
+`agxg10p-cstring.txt`):
+
+```
+IOGPUCommandDescriptor = ^^?  i  A  I  ^{IOGPU}  ^^{OSObject}  ii
+                         ^^{IOGPUMemory}  ii
+                         {IOGPUIOFenceListHead=^{sIOGPUIOFence}^^{sIOGPUIOFence}}
+                         i  B  B  ^{IOGPUWorkQueue}  ^{IOGPUTask}
+                         ^{IOGPUCommandQueue}  ^{IOGPUBlockFence}
+                         Q  I  I
+                         {IOGPUEvent={?=I[15I]}}  {IOGPUEvent={?=I[15I]}}
+                         Q  Q  ^^v  I  i  i
+```
+
+`IOGPUEvent` is a 64-byte tagged union (`I` + `[15I]`). This is exactly the
+structure a stub would have to produce and consume.
+
+#### 2.2.3 What the accelerator demands from the device tree
+
+`AGXG10P.__cstring` is effectively a checklist:
+
+* **register ranges, by name**: `FenderRegs`, `AICTimerRegs`, `AICSWIntRegs`,
+  `RGXRegs`, `UVDRegs` (plus `-(unused)` placeholders), with the failure modes
+  spelled out: `"Fender address unknown"`, `"Could not map GPU reg range"`,
+  `"Could not map Fender reg range"`,
+  `"Unsupported number of reg ranges in EDT (%u)"`,
+  `"Fender address is unknown"`.
+* **device tree paths**: `IODeviceTree:/chosen` - `chip-id`;
+  `IODeviceTree:/arm-io` - `chip-revision`.
+* **properties**: `gpu-num-perf-states`, `perf-states`, `perf-states-sram`,
+  `function-reliability_monitor`, `gpu-sysmem-reserve-percent`,
+  `gpu-idleoff-{fn-hit,fi-hit,fn-miss,fi-miss,nei-hit,min_conf,high-conf,reset-iter,standby-timer,prob-init-val}`,
+  `gpu-pwr-sample-period(-aic-clks)`, `interrupts`, `interrupts-valid`,
+  `meta-sw-interrupt`, `num_cores num_frags num_gps num_mgpus usc_gen
+  core_mask_list gpu_gen`.
+* **a hard page-size check**: `"GPU uses 16K page size but CPU does not"`.
+* AGX core revision names it will accept: `G5P G5G G9P G9G G10P G11P G11M
+  G11G G12P G13P G13G G14P G14G G15M G15P _AGX2`, revisions `A0 A1 B0 B1 C0 C1`.
+
+#### 2.2.4 The part that is firmware, not driver
+
+`AGXG10P` is not self-contained. Its strings describe an ARM firmware running
+*inside* the GPU, and a mailbox protocol to it:
+
+```
+AGXArmFirmware   AGXArmFirmwareKingfisherV4   AGXArmFenderKingfisher
+AGXFirmware / GFXFW / AGFI-    AGFITimeStampQueue    AGFIChannelState
+"Firmware/Driver Shared"       "Firmware Channel State Pool"
+"Firmware Timestamp Queue Pool" "Firmware VDM Command Pool"
+"Firmware PDM Blit Command Pool" "Firmware CDM Command Pool"
+"Firmware Barrier Pool"         "Firmware PM Grow/Rebuild Pool"
+"AGXk: %s:%d:%s: !!! Firmware wasn't stopped for recovery"
+"AGXArmFirmware::kickFirmware: Command submission is disabled!"
+"AGXk: pid=%u name=%s panicking due to submission while the GPU is powered off!"
+"Failed to reboot the firmware"
+firmware-detected lockup / firmware assert / CDM Kill timeout / timestamp timeout
+```
+
+and the kext list confirms two **separate firmware kexts**:
+`com.apple.AGXFirmwareKextRTBuddy` (227.6.5) and
+`com.apple.AGXFirmwareKextG10PRTBuddy`, loaded over `RTBuddy` (Apple's
+coprocessor mailbox/IPC driver). On A11, "the GPU" is a separate ARM processor
+running Apple-signed firmware; the kernel driver is a message pump to it.
+
+That single fact decides -3(a) and -4.
+
+### 2.3 What happens after a device exists
+
+From the kernel side: **there is no probe-then-fallback path.** The classes
+userland talks to have no "device present but non-functional" state; the
+sequence is mandatory and each step fails hard:
+
+1. `IOGPU::start()` -- requires `accelName`, `numEventChannels` (-1),
+   `waitForGPUTimeoutSeconds` (-0), `maxSchedulerPriorityCount`; fails with
+   `"provider is not the right device"` if the provider is not an `IOGPU`
+   subclass and `"configureDevice failed"` if the subclass's configure step
+   fails. It then builds an event machine, device namespace, work-queue
+   namespace, `IOGPUFenceMachine`, `IOGPUScheduler`, a kernel GPU task, and
+   registers with `IOPerfControlClient` (`"registerDevice failed"`).
+2. `AGXAccelerator::start()` -- six lock allocations, then
+   `configureDevice()` maps the EDT register ranges (-2.2.3) and fails hard if
+   `Fender` is missing; then timestamp mappings
+   (`"Failed to prepare timestamp mapping[%d]"`), IOFence structures, CSC table.
+3. `AGXAcceleratorG10::requestFirmwareBinary()` -- the firmware handshake. Without
+   it, submission is disabled (`kickFirmware: Command submission is disabled!`).
+
+So the chain is **device object - accelerator start - EDT register map -
+firmware handshake - command queues**, and the first three must be real enough
+to satisfy the fourth.
+
+#### 2.3a The userland side
+
+See -7.
+
+### 2.4 GPU family / feature negotiation
+
+`supportsFamily:` and every `MTLDevice` feature boolean live in the userspace
+plugin `AGXMetalA11` (`MetalPluginName`), which is what
+`MTLCreateSystemDefaultDevice()` loads, and that bundle is inside the dyld
+shared cache -- see -7.
+
+What the kernel pins down beyond doubt: **the family is chosen by
+`IONameMatch`**. `gpu,t8015` - A11 - `AGXG10P` - `MetalPluginName AGXMetalA11`
+(-2.2.1). The name-plugin mapping is a static personality table; there is no
+kernel-side knob for "pretend to be a lower family". Any attempt to negotiate a
+weaker feature set has to happen inside the plugin, i.e. inside Apple's signed
+userland.
 
 ---
 
-## 7. Effort, honestly
+## 3. Phase 3 -- every option, ranked, hardware traced
 
-**Two weeks, realistic deliverable** (and it is not "a driver"):
+### (c) MDP5/MDSS 2D hardware composition replacing the `memcpy` -- **the real win**
 
-* **Days 1-3 — resolve the unknowns (§8 steps 1-3).** Dump MDSS/MDP registers
-  from a working Android boot of the same phone; decide CTL_LAYER variant, stage
-  ordinal, VBIF defaults, SMMU state, and whether a 10.4 MB contiguous
-  allocation succeeds. This is reading and measuring, and it is where the
-  project either becomes easy or dies. *If the SMMU turns out to be programmed,
-  everything below changes and the honest answer becomes "write an SMMU driver
-  first", i.e. months.*
-* **Days 4-6 — MDSS power/clock bring-up in XNU.** A ~100-line driver that
-  powers the domain, ungates clocks, and reads `MDSS_HW_VERSION` at
-  `0x0C900000` plus a MDP register round-trip. No display, no risk to the UI.
-  This alone is a real milestone: it proves XNU can own the MMSS power domain.
-* **Days 7-10 — boot-time blit self-test.** Blit a 256x256 pattern from a
-  contiguous scratch buffer to another scratch buffer, verify by CPU read-back.
-  No panel involvement, no interaction with CA.
-* **Days 11-14 — wire into `present()` behind a boot-arg**, with `memcpy`
-  fallback and a counter of hardware vs software presents in the log; measure
-  CPU time in the vsync path and try `sweetfb_hz=60` again.
+**What it removes.** `SweetFramebuffer.cpp:393-399` -- one `memcpy` per row per
+enabled layer, into panel memory that is mapped **write-combining**
+(`SweetSurface.cpp`, `sweet_surface_create_physical()`: `s->mapCache =
+kIOMapWriteCombineCache`). Every store in that loop bypasses the D-cache.
 
-**What two weeks does not buy:** scaling (that is (c), another month with
-coefficient tables and VIG pipes), tear-free page flipping, or anything
-resembling 3D.
+Why that matters, with numbers: a full frame is `1080 x 2400 x 4 =
+10 368 000 B`; at the 30 Hz the port runs at (`sweetfb_hz=30` in
+`tools/devices.py`), that is 311 MB/s of WC stores plus 311 MB/s of cached
+reads = **622 MB/s** of DRAM traffic against roughly **29.8 GB/s** of DRAM on
+these SoCs. Bandwidth is *not* the constraint; per-store efficiency on
+`Normal-NC` memory is. (The port's own measurement -- NOTES.md:325 -- is that
+copying 10 MB per swap at 60 Hz "took the whole CPU"; the mitigation was to cut
+the present rate, not to speed up the copy.)
 
-**What a real Adreno driver would take:** 6-12 person-months for a
-freedreno-class bring-up under XNU (power/clock/GMU, CP ringbuffer, GPU SMMU,
-microcode loading), plus the TrustZone/PIL problem which is **not solvable**
-without Qualcomm-signed firmware and a secure-world client — and it would still
-be invisible to Apple's Metal (§3(a)). **Do not start it.**
+**The hardware.** MSM8998's display pipeline is MDP5-class: `SDE_HW_VER_300` is
+annotated `/* 8998 v1.0 */` and `SDE_HW_VER_301` `/* 8998 v1.1 */` at
+`sde_hw_catalog.h:45-46`. The 2D path is
+**SSPP (source pipe) - layer mixer (LM) - writeback (WB) - panel memory**.
 
-**What is impossible without Apple's closed source:** (i) making Metal or GLES
-target non-Apple silicon (the shader compiler is in the userland we must keep
-unmodified); (ii) knowing the accelerator user-client ABI without the dyld
-shared cache; (iii) optimising `CA::OGL::SW`'s inner loops; (iv) the AGX command
-stream format.
+Base addresses, from the live MSM8998 device tree
+(`arch/arm64/boot/dts/qcom/msm8998-mdss.dtsi`, LineageOS
+`android_kernel_xiaomi_msm8998`):
+
+| block | offset | source (line read) |
+|---|---:|---|
+| MDP registers | `0x0C900000`, size `0x90000` | `msm8998-mdss.dtsi:17` (`reg = <0x0c900000 0x90000>, <0x0c9b0000 0x1040>`; `reg-names = "mdp_phys","vbif_phys"`) |
+| VBIF | `0x0C9B0000`, size `0x1040` | `msm8998-mdss.dtsi:17` |
+| MDP top offset | `+0x1000` | `msm8998-mdss.dtsi:58` (`qcom,mdss-mdp-reg-offset = <0x00001000>`) |
+| interrupt | GIC SPI 83 - INTID 115 | `msm8998-mdss.dtsi:20` (`interrupts = <0 83 0>`) |
+| VIG0..3 SSPP | `0x5000 0x7000 0x9000 0xB000` | `msm8998-mdss.dtsi:67` |
+| DMA0..3 SSPP | `0x25000 0x27000 0x29000 0x2B000` | `msm8998-mdss.dtsi:69` |
+| CURSOR0/1 SSPP | `0x35000 0x37000` | `msm8998-mdss.dtsi:71` |
+| CTL0..4 | `0x2000 0x2200 0x2400 0x2600 0x2800` | `msm8998-mdss.dtsi:91` |
+| LM0..3 (mixer+intf) | `0x45000 0x46000 0x47000 0x4A000` | `msm8998-mdss.dtsi:93` |
+| DSPP0/1 | `0x55000 0x57000` | `msm8998-mdss.dtsi:95` |
+| **WB** | **`0x66000`** | `msm8998-mdss.dtsi:96` (`qcom,mdss-wb-off`) |
+| INTF0..3 | `0x6B000 0x6B800 0x6C000 0x6C800` | `msm8998-mdss.dtsi:97` |
+| Pingpong 0,1,4 | `0x71000 0x71800 0x72000` | `msm8998-mdss.dtsi:99`; slave-pp `0x73000` at `:101` |
+
+SSPP registers (relative to pipe base), all from `mdp5.xml.h` (generated from
+`envytools/rnndb/mdp/mdp5.xml`, so these are Qualcomm-derived, not guesses):
+
+| register | off | fields | source |
+|---|---:|---|---|
+| `SRC_SIZE` | `0x00` | `w[15:0] h[31:16]` | `mdp5.xml.h:696` (masks `:698-706`) |
+| `SRC_IMG_SIZE` | `0x04` | `w[15:0] h[31:16]` | `mdp5.xml.h:710` |
+| `SRC_XY` | `0x08` | `x[15:0] y[31:16]` | `mdp5.xml.h:724` |
+| `OUT_SIZE` | `0x0C` | `w[15:0] h[31:16]` | `mdp5.xml.h:738` |
+| `OUT_XY` | `0x10` | `x[15:0] y[31:16]` | `mdp5.xml.h:752` |
+| `SRC0_ADDR` | `0x14` | **32-bit; no `_HI` register exists** | `mdp5.xml.h:766`; `grep ADDR_HI mdp5.xml.h` - none |
+| `SRC1..3_ADDR` | `0x18 0x1C 0x20` | plane 1..3 | `mdp5.xml.h:768-772` |
+| `SRC_STRIDE_A` | `0x24` | `P0[15:0] P1[31:16]` | `mdp5.xml.h:774` |
+| `SRC_STRIDE_B` | `0x28` | `P2 P3` | `mdp5.xml.h:788` |
+| `SRC_FORMAT` | `0x30` | see below | `mdp5.xml.h:804` |
+| `SRC_UNPACK` | `0x34` | 4 element indices, one byte each | `mdp5.xml.h:858` |
+| `SRC_OP_MODE` | `0x38` | `FLIP_LR 0x2000`, `FLIP_UD 0x4000` | `mdp5.xml.h:884-899` |
+| `SRC_CONSTANT_COLOR` | `0x3C` | solid fill | `mdp5.xml.h:901` |
+| `FETCH_CONFIG` | `0x48` | | `mdp5.xml.h:903` |
+| `DECIMATION` | `0xB4` | | `mdp5.xml.h:923` |
+
+`SRC_FORMAT` bit layout (`mdp5.xml.h:804-857`, encoder at
+`sde_hw_sspp.c:281-317`): `[1:0] R_BPC-1`, `[3:2] G_BPC-1`, `[5:4] B_BPC-1`,
+`[7:6] A_BPC-1`, `[8] ALPHA_ENABLE` (written as `BIT(8)`/`SRCC3_EN` at
+`sde_hw_sspp.c:289`), `[10:9] CPP-1`, `[13:12] UNPACK_COUNT-1`,
+`[17] UNPACK_TIGHT`, `[18] UNPACK_ALIGN_MSB`, `[20:19] FETCH_TYPE`,
+`[23:22] CHROMA_SAMP`. Channel order is set by the four `SRC_UNPACK` bytes:
+`sde_formats.c:204-260` gives `ARGB8888 = {C1_B_Cb, C0_G_Y, C2_R_Cr,
+C3_ALPHA}` and `ABGR8888 = {C2_R_Cr, C0_G_Y, C1_B_Cb, C3_ALPHA}`, which is how
+you encode BGRA-vs-RGBA without a colour matrix.
+
+LM registers (`sde_hw_lm.c:19-28`, `mdp5.xml.h:1080-1160`):
+`LM_OP_MODE 0x00`, `LM_OUT_SIZE 0x04`, `LM_BORDER_COLOR_0 0x08`;
+blend stage *n* at `0x20 + 0x30-n`, `n - {0,1,2,3}`
+(`__offset_BLEND`, `mdp5.xml.h:1104-1110`), and within a stage
+`BLEND_OP +0x00`, `FG_ALPHA +0x04`, `BG_ALPHA +0x08` (`sde_hw_lm.c:25-28`).
+`sde_hw_lm_setup_out()` (`sde_hw_lm.c:76-95`) writes `h<<16|w` to `LM_OUT_SIZE`
+and clears `BIT(31)` for a non-split mixer.
+
+WB registers (`sde_hw_wb.c:20-48`), relative to WB base `0x66000`:
+
+| register | off | source |
+|---|---:|---|
+| `WB_DST_FORMAT` | `0x000` | `sde_hw_wb.c:20` |
+| `WB_DST_OP_MODE` | `0x004` | `:21` |
+| `WB_DST_PACK_PATTERN` | `0x008` | `:22` |
+| `WB_DST0..3_ADDR` | `0x00C 0x010 0x014 0x018` | `:23-26` |
+| `WB_DST_YSTRIDE0` | `0x01C` | `:27` |
+| `WB_DST_WRITE_CONFIG` | `0x048` | `:35` |
+| `WB_OUT_SIZE` | `0x074` | `:42` |
+| `WB_ALPHA_X_VALUE` | `0x078` | `:43` |
+| `WB_DST_ADDR_SW_STATUS` | `0x2B0` | `:45` |
+| `WB_OUT_IMAGE_SIZE` | `0x2C0` | `:47` |
+| `WB_OUT_XY` | `0x2C4` | `:48` |
+
+`WB_DST_FORMAT` (`sde_hw_wb.c:96-133`):
+`(chroma_samp<<23)|(fetch_planes<<19)|(bits[C3]<<6)|(bits[C2]<<4)|(bits[C1]<<2)|bits[C0]`,
+plus `BIT(8)` (`DSTC3_EN`) when alpha is present, `BIT(14)` (`DST_ALPHA_X`),
+`BIT(21)` for DX formats, then
+`(unpack_align_msb<<18)|(unpack_tight<<17)|((unpack_count-1)<<12)|((bpp-1)<<9)`.
+`WB_DST_YSTRIDE0 = pitch[0] | (pitch[1]<<16)`, `WB_OUT_SIZE = h<<16|w`.
+
+CTL (`mdp5.xml.h:380-499`, `sde_hw_ctl.c:27-31`): `CTL_LAYER0..5 0x00..0x14`,
+`CTL_OP 0x014`, `CTL_FLUSH 0x018`, `CTL_START 0x01C`, `CTL_SW_RESET 0x030`,
+`CTL_LAYER_EXT 0x40`.
+
+`CTL_FLUSH` bits, cross-checked between two independent sources --
+`mdp5.xml.h:469-497` (`VIG0 0x1 VIG1 0x2 VIG2 0x4 RGB0 0x8 RGB1 0x10 RGB2 0x20
+LM0 0x40 LM1 0x80 LM2 0x100 LM3 0x200 LM4 0x400 DMA0 0x800 DMA1 0x1000
+DSPP0 0x2000 DSPP1 0x4000 DSPP2 0x8000 WB 0x10000 CTL 0x20000 -`) and
+`sde_hw_ctl.c`'s `get_bitmask_sspp()` (VIG0..3 - `BIT(0..2)`, `BIT(18)`;
+DMA0/1 - `BIT(11)/BIT(12)`), `get_bitmask_mixer()` (LM0..4 - `BIT(6..10)`,
+plus `BIT(17)` for CTL) and `get_bitmask_wb()`.
+
+**The commit handshake**, exactly as `mdp5_ctl_commit()` does it
+(`mdp5_ctl.c:495-530`): write `CTL_FLUSH` with the accumulated mask, then if a
+start is pending `send_start_signal()` writes `1` to `CTL_START`
+(`mdp5_ctl.c:227-236`). Before that, `set_ctl_op()` (`mdp5_ctl.c:148-176`)
+programs `CTL_OP`: `MDP5_CTL_OP_INTF_NUM(INTF0+num)` for a real interface,
+`MDP5_CTL_OP_CMD_MODE` (`0x20000`) for command-mode DSI, and
+`MDP5_CTL_OP_MODE(MODE_WB_2_LINE)` for writeback -- with `CTL_OP_MODE` in
+`[3:0]` and `INTF_NUM` in `[6:4]` (`mdp5.xml.h:447-459`).
+
+**Minimum viable implementation** (working skeleton: `/root/mdss-blit-skeleton.c`,
+which compiles clean under `gcc -fsyntax-only` and `gcc -O2 -c`):
+
+1. Map `0x0C900000+0x90000` and `0x0C9B0000+0x1040` as two IOKit ranges from an
+   `/arm-io` child -- the same nub mechanism `AppleCLCD` already uses.
+2. **Go/no-go probe:** read `0x0C901000 + 0x0` (`MDP_HW_VERSION`,
+   `mdp5.xml.h:211-231`). A plausible major/minor proves the block is clocked
+   and the mapping is right. If it reads 0 or all-ones, this option is blocked
+   until the MMSS clocks and GDSCs are up (`msm8998-mdss.dtsi:107-114` lists 7
+   clocks -- `mnoc_clk iface_clk bus_clk core_clk_src core_clk vsync_clk lut_clk`
+   -- plus `vdd-supply = <&gdsc_mdss>` and
+   `gdsc-core-supply = <&gdsc_bimc_smmu>`), which is a different project.
+3. Program one DMA SSPP for the source rect, LM0 for the destination window, WB
+   for the panel memory; then `CTL_FLUSH` and `CTL_START`.
+4. Wait: poll WB completion, or accept the existing vsync timer as pacing
+   (`present()` already runs on one).
+
+**Two hard constraints, both verified:**
+
+* **Addresses must be below 4 GiB.** `SRC0_ADDR` is 32 bits with no `_HI`
+  companion (`mdp5.xml.h:766`), and `sde_hw_sspp.c:748-750` writes
+  `cfg->layout.plane_addr[i]` straight through `sde_reg_write()` -
+  `writel_relaxed()` (32-bit) -- `sde_hw_util.c`, `sde_reg_write` body. For this
+  port that is automatic: both boards' kernel RAM windows are below 4 GiB
+  (`tools/devices.py`: sweet `ram_low = 0xb0000000 + 0x4d000000`, chiron
+  `ram_low = 0xa0000000 + 0x60000000`) and the panel memory is at
+  `0x9c000000` (sweet) / `0x9d400000` (chiron).
+* **SMMU.** MSM8998 routes MDP through `mmss_smmu` (`msm8998-mdss.dtsi:233-259`,
+  `smmu_mdp_unsec` / `smmu_mdp_sec` context banks, `iommus = <&mmss_smmu 0>`
+  and `<&mmss_smmu 1>`). Whether the bootloader left it bypassed is
+  **unverified**; if it is enforcing, the blit faults and the fix is a page
+  table (big) or a bypass (small, if the hardware allows it).
+
+**Honest assessment.** Real, bounded win: it removes 100 % of the per-frame CPU
+pixel work and its correctness is visible on screen. It does **not** make
+`CA::OGL::SW` faster -- it makes presentation of what the CPU drew free. Risk is
+concentrated in two unknowns (clocks, SMMU), both settled by step 2 plus one
+blit attempt.
+
+**Stated limitation:** WB writes to a fixed destination. Tearing-free
+presentation needs double buffering plus a scanout flip at vsync, i.e.
+programming `INTF`/pingpong and taking panel timing away from the bootloader.
+That is the difference between 1-3 person-months and a quarter.
+
+### (b) hardware-accelerated present/copy only
+
+There is no GPU copy engine available: the Adreno is unreachable (-3(a)). The
+only engines on these SoCs that touch panel memory are (i) the MDP5 WB path of
+(c), (ii) MDP5 SSPP direct scanout -- a CA layer *is* the scanout source, zero
+copies -- and (iii) the MDP rotator (`qcom,mdss-has-separate-rotator`,
+`msm8998-mdss.dtsi:105`; rotator tuning at `:577-605`).
+
+(ii) is what iOS itself does one level up (composite, then hand the display one
+surface); here the "GPU" would be the MDP layer mixers: each CA layer becomes an
+SSPP feeding an LM stage and composition happens at scanout. It kills both the
+copy and the composition. Cost: owning DSI/PLL timing, which the bootloader does
+for us today. **Bounded but not small: ~2-4 person-months**, and it puts the
+one reliably working thing (the panel scanning out ABL's buffer) at risk.
+
+So (b) as "present/copy only" collapses into (c). Ranked separately only
+because the *goal* differs, not the hardware.
+
+### (a) XNU kgsl/Adreno driver satisfying Apple's Metal userland -- **dead end, three independent reasons**
+
+1. **Wrong command stream.** Apple's Metal driver for A11 is the userspace
+   bundle `AGXMetalA11` (-2.2.1), emitting AGX commands -- class names in
+   `agxg10p-cstring.txt` include `AGXCommandBuffer`, `AGX3DCommandDescriptor`,
+   `AGXTACommandDescriptor`, `AGXCLCommandDescriptor`,
+   `AGXRemoteNodeCommandDescriptor`, `AGXSKUEncoder`. Adreno speaks PM4
+   (`drivers/gpu/msm/adreno_pm4types.h`). Nothing translates; a translator would
+   have to reproduce Apple's compiler output, not merely an ISA.
+2. **Shaders are AGX binaries**, compiled on device by the A11 plugin for
+   Apple's ISA. Even a perfect PM4 driver changes nothing about that.
+3. **A11's GPU is a separate processor running Apple firmware** (-2.2.4:
+   `AGXFirmwareKextG10PRTBuddy`, `AGXArmFirmwareKingfisherV4`, RTBuddy IPC,
+   "panicking due to submission while the GPU is powered off"). Adreno's
+   equivalent microcode is Qualcomm-signed and PIL/SCM-loaded --
+   `adreno-gpulist.h:242-262` (`a530_pm4.fw`, `a530_pfp.fw`,
+   `a540_gpmu.fw2`, `a540_zap`), loaded at `adreno_a5xx.c:2277-2287`
+   (`subsystem_get(adreno_dev->gpucore->zap_name)`, error if it fails) and
+   `a5xx.c:683-743` (`_load_gpmu_firmware()` - `request_firmware()`). **This
+   XNU kernel has no SCM/PIL client**, so even the Adreno side cannot start.
+
+For completeness, the Adreno port would also need the SMMU (`kgsl_iommu.c`,
+69 KB), ringbuffer/dispatcher (`adreno_ringbuffer.c`, `adreno_dispatch.c`
+82 KB), power/DCVS (`kgsl_pwrctrl.c` 84 KB) and `CONFIG_QCOM_KGSL`'s
+dependency set (`drivers/gpu/msm/Kconfig:4-12`) -- a ~700 KB driver into a
+kernel with a different memory model. And it would still not run Apple's
+userland.
+
+Also worth recording: the only kgsl source on the server is the **msm8998**
+tree, which covers `a3xx/a4xx/a5xx` only -- there is **no `a6xx`** driver there,
+so sweet's Adreno 618 has no register-level reference in this workspace at all.
+Any plan that starts with "port kgsl" has to first obtain an a6xx reference.
+
+**Verdict: never.** Not "hard" -- unsatisfiable, because the client
+(`AGXMetalA11`) is compiled against hardware that neither phone contains.
+
+### (d) multi-threaded NEON / SIMD CPU rasteriser
+
+Numbers: `1080 x 2400 x 4 = 10.37 MB` per frame; at 30 Hz, 311 MB/s of WC
+stores + 311 MB/s of cached reads = **622 MB/s** against ~29.8 GB/s of DRAM;
+at 60 Hz, 1.24 GB/s. Bandwidth is not the constraint, so a faster `memcpy`
+cannot recover much -- the earlier draft's "nearly worthless" call is right in
+direction.
+
+Where the time actually goes:
+
+* the destination is `kIOMapWriteCombineCache` (`SweetSurface.cpp`,
+  `sweet_surface_create_physical`), so every store leaves the core as a
+  `Normal-NC` write; sustained single-core WC store bandwidth is far below
+  cached-copy bandwidth (**unverified on this SoC -- 10-minute measurement**);
+* rows are 4320 B = 67.5 cache lines, so each row begins and ends on a partial
+  line: 2 read-modify-writes per row;
+* the loop runs on one core inside `present()`, serialised with the vsync
+  callback.
+
+Cheapest real improvements, in order: (1) copy into a **cached** shadow surface
+and flush once per frame (or map panel memory write-back and flush by range);
+(2) one `memcpy` per *plane* instead of per row when
+`src_stride == dst_stride == w*4` (the full-screen opaque case), letting the
+compiler emit `ldp/stp` streaming loops; (3) only then split rows across cores.
+Days, not months -- and all superseded by (c) the moment (c) works.
+
+Note also that (d) as "multi-threaded rasteriser" (parallelising
+`CA::OGL::SW` itself) is *not* ours to do: `CA::OGL::SW` is inside Apple's
+signed QuartzCore. The only CPU-side lever the kernel owns is the present copy.
 
 ---
 
-## 8. Verification recipe (cheapest path to certainty)
+## 4. What still cannot be faked
 
-1. **Dump the MDP from a working Android boot on the same device.** Boot a
-   LineageOS kernel on chiron with `mdss` debug enabled and capture
-   `qcom,regs-dump-mdp` ranges (`msm8998-mdss.dtsi:147-188` lists exactly the
-   ranges, names at `:189-205`, e.g. `"CTL_0" 0x02000-0x02094`, `"DMA1_SSPP"
-   0x27000-0x27184`, `"WB_2" 0x66000-0x662c0`, `"LAYER_*"`,
-   `"DEST_SCALER_*"`). Kick a known 2D operation (screen rotation or a
-   screenshot, both use the rotator/WB) and dump again. The diff *is* the
-   working programming sequence, including CTL_LAYER variant and blend stage.
-2. **Read the MDP revision**: `MDSS_REG_HW_VERSION` at `0x0C900000`
-   (`mdss_mdp.c:2249-2255` reads it into `mdata->mdp_rev`); it selects between
-   QSEED2/QSEED3 and several CTL quirks.
-3. **Measure the SMMU state and contiguity from XNU** (or from the shim, which
-   already runs before XNU): read `0x0CD00000` (SMMU `sCR0`/`sACR`) and try a
-   `kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone` allocation of
-   1080x2400x4 at boot; log both. Two numbers that decide the whole project.
-4. **Only then** write the driver, using the skeleton as the checklist.
+The chain breaks at exactly one place, and it is not IOKit:
+
+> `MTLCreateSystemDefaultDevice()` - match `IOAcceleratorES` on an
+> `AppleARMIODevice` named `gpu,t8015` - load `MetalPluginName` =
+> `AGXMetalA11` - instantiate `MetalPluginClassName` = `AGXA11Device` - that
+> object opens `IOGPUDeviceUserClient` and starts submitting AGX command buffers.
+
+A kernel stub can satisfy every step up to the arrow into `AGXMetalA11`:
+personality, class names, registry properties, `IOGPU` subclass, user-client
+selectors, plausible return values. What it cannot supply is a GPU that
+executes the buffers, because:
+
+1. **The command encoding is AGX, not Adreno** (-3(a).1). Supporting it means
+   *interpreting* AGX streams -- that is a simulator, not a stub.
+2. **The shaders are AGX binaries** (-3(a).2), so it would also need an A11 ISA
+   emulator, and no open description of that ISA exists.
+3. **The A11 GPU is firmware-driven** (-2.2.4). The driver's real job is to feed
+   `AGXFirmwareKextG10PRTBuddy` over RTBuddy; a stub would have to *become* that
+   firmware's host, and the firmware is Apple-signed and runs only on Fender.
+
+**So: a Metal device object can be faked; a Metal device cannot.** And per -2.3
+the fake is not a useful milestone -- the moment `backboardd` has a device it
+creates a queue and submits, and the kernel family has no degraded state. Today
+`CA::OGL::` deterministically picks `CA::OGL::SW` and the GUI works; a fake
+device trades a working software path for a hang.
+
+Where a decoy service *is* valuable: as a **one-boot experiment**. Publish
+`IOAcceleratorES` / `gpu,t8015` behind a boot-arg with IOKit tracing on (patch
+0049's `sweetiolog`), boot once, and read the log to convert every "unverified"
+in -2.2 into a measurement -- exact match strings, property names, selectors,
+and what `CA::OGL::` does when a device appears and then fails. It must not be
+left enabled.
 
 ---
 
-## 9. Artefacts
+## 5. Effort estimate and the realistic two-week deliverable
 
-| path | what |
+| option | minimum viable | production | risk |
+|---|---|---|---|
+| (c) MDP5 WB blit replacing the `memcpy` | **2-3 weeks** | 1-3 person-months | clocks/SMMU unknown; settled by one register read + one blit |
+| (d) cached shadow buffer + per-plane copy + NEON | **3-5 days** | 2-4 weeks | none -- pure kernel code |
+| (b) MDP5 scanout of CA layers (zero copy) | 1-2 months | 2-4 person-months | takes DSI/panel timing from the bootloader |
+| (a) kgsl + Apple Metal | -- | -- | **not reachable** (-3(a), -4) |
+| fake `IOAcceleratorES` device | 1-2 days | -- | only as a 1-boot experiment; harmful if left on |
+
+**The realistic two-week deliverable is not "GPU acceleration":**
+
+1. **Days 1-2** -- wire `sweet_mdss_blit()` behind a boot-arg, map the two MDP
+   ranges, and log `MDP_HW_VERSION` (`0x0C901000`) plus the existing
+   `CTL_LAYER0`, `CTL_TOP`, `WB_DST_FORMAT` and `INTF` values on both boards.
+   One boot each: is the block clocked, what did the bootloader leave behind, is
+   the SMMU bypassed.
+2. **Days 3-5** -- one full-screen blit (solid colour, then a real `IOSurface`),
+   timed against the current path using the existing `SWEET FB: %llu swaps`
+   counter. Success = identical pixels, `present()` CPU time - 0.
+3. **Days 6-8** -- in parallel, the cheap CPU win as a fallback: cached shadow
+   surface + one flush, per-plane instead of per-row `memcpy`. Also covers
+   chiron if the SMMU blocks (c).
+4. **Days 9-10** -- the decoy-`IOAcceleratorES` boot with `sweetiolog`, to
+   replace -2.2's unverified items with log lines.
+5. **Days 11-14** -- land the `present()` change behind the boot-arg, confirm the
+   home screen still draws on both boards, write it up.
+
+Anything promising a Metal device in two weeks is promising a demo that hangs
+`backboardd`.
+
+---
+
+## 6. Artefacts and how to re-check them
+
+| path (build server) | what |
 |---|---|
-| `/root/gpu-research.md` | this report |
-| `/root/mdss-blit-skeleton.c` | the skeleton blit driver (§6) |
-| `E:\ios-sweat\gpu-research.md` | copy of this report (via `remote.py put`) |
-| `E:\ios-sweat\artifacts\gpu\` | local copies of every file cited here, for line-number verification: `mdss_mdp_hwio.h`, `mdss_mdp_ctl.c`, `mdss_mdp_pipe.c`, `mdss_mdp_intf_writeback.c`, `mdss_mdp_formats.h`, `mdss_mdp.h`, `mdss_mdp.c`, `msm8998-mdss.dtsi`, `SweetFramebuffer.cpp`, `SweetSurface.{h,cpp}` |
-| `/tmp/fmtcheck.c` (generated by `E:\ios-sweat\s_gpu_fmtcheck.sh`) | the constant-verification program of §5.2: re-implements the two format encoders and asserts `SRC 0x236FF`, `DST 0x237FF`, `PATTERN 0x03020001`, `CTL_FLUSH 0x11200`, plus the §5.1 address arithmetic |
+| `/root/dsc/kc/kernelcache.release.iphone10b` | the 18 204 358-byte IM4P as pulled from the IPSW |
+| `/root/dsc/kc/kc.bin/kernelcache.release.iphone10b.decompressed` | `ipsw kernel dec` output, 50 937 856 bytes |
+| `/root/dsc/kc/kexts.json` | `ipsw kernel kexts --json`, all 239 kexts |
+| `/root/dsc/out/prelink-gpu-region.xml` | raw `_PrelinkInfoDictionary` slice with the GPU personalities |
+| `/root/dsc/out/agxg10p-personalities.xml` | `AGXG10P_A0/B0` personality dicts, verbatim |
+| `/root/dsc/out/agxg10p.kext`, `iogpufamily.kext` | carved Mach-Os (`carve_kext.py`) |
+| `/root/dsc/out/agxg10p-cstring.txt` | AGX `__cstring` + all C++ type encodings (56 + encodings) |
+| `/root/dsc/out/iogpufamily-cstring.txt` | IOGPU `__cstring` -- the user-client method names |
+| `/root/dsc/out/iogpufamily-oslog.txt` | IOGPU `__os_log`, 244 format strings = the whole error surface |
+| `/root/dsc/out/agxg10p-text-dis.txt` | 97 891 lines, AGX `__TEXT_EXEC.__text` disassembly |
+| `/root/dsc/out/iogpufamily-text-dis.txt` | IOGPU `__TEXT_EXEC.__text` disassembly |
+| `/root/mdss-blit-skeleton.c` | the MDP5 blit skeleton (compiles; not wired into the build) |
 
-No file in `/root/ios-sweet` was modified (`git status --porcelain` is empty at
-`0cc62e6`); nothing was committed, flashed, rebooted or run on hardware.
+Reproduce:
+
+```bash
+ipsw kernel dec kernelcache.release.iphone10b -o kc.bin
+ipsw kernel kexts --json kc.bin/*.decompressed > kexts.json
+python3 carve_kext.py kc.bin/*.decompressed 0x10ff980 agxg10p.kext     # AGXG10P
+python3 carve_kext.py kc.bin/*.decompressed 0x10f8440 iogpufamily.kext # IOGPUFamily
+llvm-objdump -d --no-show-raw-insn --section=__text agxg10p.kext > agxg10p-text-dis.txt
+```
+
+The header offsets `0x10ff980` / `0x10f8440` are the `feedfacf` Mach-O headers
+found at the `_PrelinkExecutableLoadAddr` values `0xfffffff00554b980` /
+`0xfffffff005544440`, both inside `__PRELINK_TEXT.__text`, which starts at file
+offset `0x97c000` for VA `0xfffffff004dc8000`. `carve_kext.py` then copies each
+`LC_SEGMENT_64` from its own declared `fileoff`, and relocates `__TEXT`
+(fileoff 0) from the prelink region -- that relocation is required; without it
+`llvm-objdump` correctly rejects the carve as malformed.
+
+---
+
+## 7. The dyld-cache answers (QuartzCore / Metal / AGXMetalA11)
+
+*Filled in below when the cache extraction completed. If this section says
+"not reached", the 4.73 GB filesystem DMG did not finish downloading inside the
+session, and everything the kernelcache can prove is already in -2.2--2.4.*
+
+### 7.1 Renderer selection (Phase 2.1)
+
+### 7.2 Metal device discovery (Phase 2.2, userland half)
+
+### 7.3 Post-device call path (Phase 2.3, userland half)
+
+### 7.4 GPU family negotiation (Phase 2.4)
+
+---

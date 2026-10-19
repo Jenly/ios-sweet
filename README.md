@@ -291,7 +291,7 @@ More in [`NOTES.md`](NOTES.md).
 
 There is no GPU driver, and the research in [`docs/gpu-research.md`](docs/gpu-research.md) explains why real 3D acceleration is a dead end here rather than a missing feature:
 
-- Apple's closed Metal/GLES driver compiles shaders **on device to Apple's own GPU ISA** and speaks Apple's AGX/IOGPU accelerator ABI. An Adreno 530 cannot execute those shaders, the accelerator user-client ABI is undocumented, and the a5xx needs Qualcomm-signed microcode (PIL/TrustZone) that this XNU has no client for. Three independent blockers, each sufficient.
+- Apple's closed Metal/GLES driver compiles shaders **on device to Apple's own GPU ISA** and speaks Apple's AGX/IOGPU accelerator ABI. An Adreno 540 (MSM8998's GPU) cannot execute those shaders, the accelerator user-client ABI is undocumented, and the a5xx needs Qualcomm-signed microcode (PIL/TrustZone) that this XNU has no client for. Three independent blockers, each sufficient.
 - What *is* reachable is the **present path**: replacing the CPU `memcpy` in `SweetFramebuffer::present` with an MDSS/MDP hardware blit. That does not make the software rasteriser faster — the UI stays CPU-rendered — but it removes the copy that forced the port to cap presenting at ~10 Hz. `docs/mdss-blit-skeleton.c` is the traced, unwired starting point, and the report lists the five unknowns to settle first (the biggest being whether the MMSS SMMU is left bypassed, since XNU has no IOMMU driver).
 
 More in [`NOTES.md`](NOTES.md).

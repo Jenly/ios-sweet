@@ -2,6 +2,99 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20: XNU now compiles on Linux (no macOS needed) <<<
+
+**The question was "can't we just run it locally?" The answer is yes, mostly.**
+Until now every patch cost a GitHub macOS round trip to find out whether it
+compiled. It does not have to: clang can target Darwin from Linux, and almost
+every header XNU needs is in the source tree.
+
+`tools/xnu-localcc.py TREE [FILE...]` assembles that environment and compiles
+what you name. Result on the current tree:
+
+```
+ok   bsd/dev/chiron_touch.c
+ok   bsd/dev/sweet_keys.c
+ok   bsd/dev/sweet_touch.c
+ok   bsd/dev/sweet_usb.c
+ok   iokit/Kernel/arm/SweetBattery.cpp
+ok   iokit/Kernel/arm/SweetFramebuffer.cpp
+ok   iokit/Kernel/arm/SweetPlatformExpert.cpp
+ok   iokit/Kernel/arm/SweetCPU.cpp
+ok   iokit/Kernel/arm/hid/SweetHID.cpp
+ok   iokit/KernelConfigTables.cpp
+
+10 compiled, 0 failed
+```
+
+with real object emission (`--obj out.o` gives `Mach-O 64-bit arm64 object`).
+
+**How it works, and what it took to get there.** Five things are not in the
+tree and each was a separate wall:
+
+1. **A libc.** Not needed for linking, but the headers must typecheck. A
+   declarations-only `string.h`/`stdio.h`/`stdlib.h`/`limits.h` with
+   `extern "C"` guards (without the guards, C++ units hit "different language
+   linkage" against the tree's own `libkern.h`).
+2. **`TargetConditionals.h`.** The SDK header; only the `TARGET_*` family.
+3. **The Apple-clang builtins.** `osfmk/kern/kalloc.h` calls
+   `__builtin_xnu_type_signature()`, a private builtin of Apple's clang fork.
+   Upstream clang does not know it, so any unit reaching kalloc.h dies inside
+   XNU's own header. A forced-include shim supplies the right shape.
+   **Checked, not assumed:** `apple-oss-distributions/clang` is a 2017-era
+   snapshot (LLVM 3.9, tags stop at `clang-800.0.42.1`) with **zero** `xnu`
+   builtins in it, so building Apple's open-source clang does not help -- those
+   builtins ship only inside Xcode's clang. The shim is the correct answer.
+4. **mig output.** 13 `mach/*.h` headers are generated from the `.defs` files by
+   Apple's `mig`, and are absent. Empty stubs are enough *except* for the
+   routines the tree actually calls: `thread_terminate` and `processor_start`
+   are declared in `mach/thread_act.h` / `mach/processor.h`, which is why
+   `SweetCPU.cpp` uses them without a local `extern`. Those got real
+   declarations taken from the tree's own `.defs` and `osfmk/man/*.html`.
+5. **`.iig`-generated metaclass types.** `OSMetaClass.h`'s dispatch macros
+   expand to `className ## _Methods className ## _KernelMethods`, i.e. a member
+   declaration whose types come from the `.iig` files. Hand-listing class names
+   was whack-a-mole; the tool now **generates them by scanning the tree** for
+   every `OSDeclare*Structors(Class)` and every `<DriverKit/X.h>` include.
+   That is what finally turned SweetFramebuffer.cpp green.
+
+**What this proves and what it does not.** Syntax, types, declarations, config
+macros, C/C++ language rules -- every reason CI fails with `error:` rather than
+`Undefined symbols`. It does **not** prove linking: there is no linker, no
+cctools, and the mig stubs are hand-written, so anything crossing a Mach message
+interface is unverified. Treat a clean run as "this patch will compile", not
+"the kernel will build". There is also a stale `docs/mdss-blit-skeleton`-style
+caveat: with empty `_Methods` macros the C++ class *layout* is not the SDK's, so
+do not trust offsets or sizes from a local compile.
+
+**GPU: the deep dive landed, and it corrects me on a hardware fact.**
+`docs/gpu-research.md` (replacing an earlier, weaker study kept as
+`docs/gpu-research-superseded.md`) traced Apple's **kernelcache** rather than
+guessing. Verdict unchanged in direction, much stronger in evidence:
+
+- A Metal device *object* can be faked; a Metal device cannot -- and faking it
+  is **worse than not doing it**, because IOGPU/AGX have no "present but
+  non-functional" state and backboardd submits as soon as it sees a device.
+- The kernel-side contract is now known verbatim from
+  `_PrelinkInfoDictionary`: `IOMatchCategory = IOAcceleratorES`,
+  `IOClass = AGXAcceleratorG10P_B0`, `IONameMatch = ("gpu,t8015")`,
+  `MetalPluginName = AGXMetalA11`, `IOGLESBundleName = AppleMetalGLRenderer`.
+  Note `gpu-core-count` and `IOGLBundleName` (as previously guessed) do **not**
+  exist in 20H392 -- the real keys differ.
+- The chain breaks at `AGXMetalA11`: the A11 GPU is a separate processor with
+  its own signed firmware, so a stub would have to host Fender.
+- **Correction to my earlier notes: MSM8998 is an Adreno 540, not a 530**
+  (`a540` entries in `adreno-gpulist.h:242-262`). Fixed in README.
+- The real win stands: an MDP5 writeback blit replacing the memcpy in
+  `AppleCLCD::present`, with the commit handshake traced
+  (`CTL_FLUSH` then `CTL_START`). Constraint found: the destination is mapped
+  `kIOMapWriteCombineCache`, so the copy is per-store-latency bound, not
+  bandwidth bound -- which is why NEON tuning cannot help.
+
+**State:** 10/10 touched files compile locally; `0001-0083` applies cleanly;
+touch unit tests + patch drift pass; sweet ADT/shim regressions unchanged.
+Still never linked, never booted on hardware.
+
 ### >>> UPDATE 2026-10-19 late #3: kernel-API audit of the new code (pre-CI) <<<
 
 CI cannot be run from this server (no `gh`, no GitHub credentials), so the
