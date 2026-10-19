@@ -1,0 +1,225 @@
+/*
+ * sweet_hwprobe.c -- consolidated read-only hardware report for first boot.
+ *
+ * WHY. chiron has never run this kernel. When it first does, the only thing that
+ * matters is finding out which blocks answered. Today that information is
+ * scattered across drivers that each probe one thing and print in their own
+ * format, and several of them only run after the touch thread or the battery
+ * service has started -- so a boot that dies early produces almost no
+ * information at all.
+ *
+ * This gathers one block of output, early, in a fixed order, before anything can
+ * fail, and it only READS. That makes it safe to run on a board whose power state
+ * is unknown, and it is the single most useful thing to have on the first boot.
+ *
+ * OPT-IN, deliberately: `sweethwprobe=1`. Reading an unclocked Qualcomm block
+ * usually returns zero, but on some interconnects a read to a gated block stalls
+ * the bus. Since the point is to make the first boot informative rather than
+ * risky, the default is off and the first boot should pass the boot-arg.
+ *
+ * EVERY ADDRESS BELOW IS PER-SOC and comes from the live device tree fragments in
+ * /root/src/kernel_msm8998 (LineageOS/android_kernel_xiaomi_msm8998), cited
+ * inline. Nothing is guessed from a datasheet.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <kern/clock.h>
+#include <machine/machine_routines.h>
+#include <pexpert/pexpert.h>
+#include <pexpert/SweetBoard.h>
+
+#include "sweet_spmi_v1.h"
+
+void sweet_hwprobe_run(void);
+
+extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+
+/* ---------------------------------------------------------------- MSM8998 */
+/* msm8998.dtsi:593  spmi  @ 0x0800f000 (handled by sweet_spmi_v1.c)          */
+/* msm8998-mdss.dtsi:17  mdss @ 0x0c900000, size 0x90000                      */
+#define HP_MDSS_PA          0x0C900000u
+#define HP_MDSS_SIZE        0x00090000u
+#define HP_MDP_TOP          0x00001000u   /* msm8998-mdss.dtsi:58 */
+
+/* msm8998.dtsi:1796  ufshc @ 0x1da4000, size 0x2500                          */
+#define HP_UFS_PA           0x01DA4000u
+#define HP_UFS_SIZE         0x00002500u
+#define HP_UFS_CAP          0x00u         /* UFSHCI 2.1, section 6.2 */
+#define HP_UFS_VER          0x08u
+#define HP_UFS_HCS          0x30u
+#define HP_UFS_HCE          0x34u
+
+/* msm8998.dtsi:1934  dwc3 @ 0xa800000, size 0xcd00                           */
+#define HP_DWC3_PA          0x0A800000u
+#define HP_DWC3_SIZE        0x0000CD00u
+#define HP_DWC3_GSNPSID     0xC120u       /* DWC3 databook: GSNPSID */
+#define HP_DWC3_GCTL        0xC110u
+#define HP_DWC3_DCFG        0xC700u
+#define HP_DWC3_DSTS        0xC704u
+
+/* msm8998.dtsi:1981  qusb2 phy @ 0xc012000 (qcom,qusb2phy-v2)               */
+#define HP_QUSB2_PA         0x0C012000u
+#define HP_QUSB2_SIZE       0x000002A8u
+
+/* msm8998.dtsi  TLMM @ 0x03400000                                            */
+#define HP_TLMM_PA          0x03400000u
+#define HP_TLMM_SIZE        0x00300000u
+#define HP_TLMM_CTL(pin)    (0x1000u + 0x1000u * ((pin) / 32u) + 4u * ((pin) % 32u))
+
+/* chiron touch pins, chiron-msm8998-mtp.dtsi:236-237 */
+#define HP_PIN_TOUCH_RESET  89u
+#define HP_PIN_TOUCH_IRQ    125u
+
+/* GIC distributor: sweet/chiron both follow the ARM GICv3 layout, and the
+ * address is in devices.py as the GICR base minus the redistributor window. */
+
+static uint32_t
+hp_rd(vm_offset_t base, uint32_t off)
+{
+	return *(volatile uint32_t *)(base + off);
+}
+
+/*
+ * One block of output per peripheral, in a fixed order so two boots can be
+ * diffed. Each line says what was read and, where the value has a meaning,
+ * what that meaning is -- a bare hex number is not a diagnosis.
+ */
+static void
+hp_mdss(void)
+{
+	vm_offset_t m = ml_io_map(HP_MDSS_PA, HP_MDSS_SIZE);
+	uint32_t ver;
+
+	if (m == 0) {
+		printf("HWPROBE mdss    : map failed (0x%x)\n", HP_MDSS_PA);
+		return;
+	}
+	ver = hp_rd(m, HP_MDP_TOP);
+	printf("HWPROBE mdss    : MDP_HW_VERSION=%#010x major=%u minor=%u step=%u\n",
+	    ver, (ver >> 28) & 0xF, (ver >> 16) & 0xFFF, ver & 0xFFFF);
+	if (ver == 0 || ver == 0xFFFFFFFFu) {
+		printf("HWPROBE mdss    : block does not answer; the panel may be "
+		    "driven by the bootloader only\n");
+	}
+}
+
+static void
+hp_ufs(void)
+{
+	vm_offset_t u = ml_io_map(HP_UFS_PA, HP_UFS_SIZE);
+	uint32_t cap, ver, hcs, hce;
+
+	if (u == 0) {
+		printf("HWPROBE ufs     : map failed (0x%x)\n", HP_UFS_PA);
+		return;
+	}
+	cap = hp_rd(u, HP_UFS_CAP);
+	ver = hp_rd(u, HP_UFS_VER);
+	hcs = hp_rd(u, HP_UFS_HCS);
+	hce = hp_rd(u, HP_UFS_HCE);
+	printf("HWPROBE ufs     : CAP=%#010x VER=%#010x HCS=%#x HCE=%#x\n",
+	    cap, ver, hcs, hce);
+	/*
+	 * UFSHCI 2.1 6.2: VER bits 7:0 = major, 15:8 = minor.
+	 * HCS bit 0 = DoorBell, bit 1 = UTRL ready.
+	 */
+	printf("HWPROBE ufs     : UFSHCI %u.%u, doorbell=%u utrl_ready=%u, "
+	    "device_init=%u\n",
+	    ver & 0xFFu, (ver >> 8) & 0xFFu, hcs & 1u, (hcs >> 1) & 1u,
+	    (hce & 1u));
+	if ((hcs & 1u) == 0) {
+		printf("HWPROBE ufs     : no doorbell -- the host is not running, "
+		    "sweet_ufs.c will not find a root device\n");
+	}
+}
+
+static void
+hp_usb(void)
+{
+	vm_offset_t d = ml_io_map(HP_DWC3_PA, HP_DWC3_SIZE);
+
+	if (d == 0) {
+		printf("HWPROBE usb     : map failed (0x%x)\n", HP_DWC3_PA);
+		return;
+	}
+	{
+		uint32_t id = hp_rd(d, HP_DWC3_GSNPSID);
+		uint32_t gctl = hp_rd(d, HP_DWC3_GCTL);
+		uint32_t dcfg = hp_rd(d, HP_DWC3_DCFG);
+		uint32_t dsts = hp_rd(d, HP_DWC3_DSTS);
+
+		printf("HWPROBE usb     : GSNPSID=%#010x GCTL=%#x DCFG=%#x DSTS=%#x\n",
+		    id, gctl, dcfg, dsts);
+		/* DWC3 databook: GSNPSID upper half is the release number. */
+		printf("HWPROBE usb     : DWC3 release %u.%u%02u, speed=%u, "
+		    "connected=%u\n",
+		    (id >> 24) & 0xFFu, (id >> 16) & 0xFFu, (id >> 8) & 0xFFu,
+		    dsts & 0x7u, (dsts >> 29) & 0x1u);
+		if (id == 0 || id == 0xFFFFFFFFu) {
+			printf("HWPROBE usb     : controller does not answer; "
+			    "sweet_usb.c has no MSM8998 addresses yet\n");
+		}
+	}
+}
+
+static void
+hp_tlmm(void)
+{
+	vm_offset_t t = ml_io_map(HP_TLMM_PA, HP_TLMM_SIZE);
+
+	if (t == 0) {
+		printf("HWPROBE tlmm    : map failed (0x%x)\n", HP_TLMM_PA);
+		return;
+	}
+	{
+		uint32_t rst = hp_rd(t, HP_TLMM_CTL(HP_PIN_TOUCH_RESET));
+		uint32_t irq = hp_rd(t, HP_TLMM_CTL(HP_PIN_TOUCH_IRQ));
+
+		/*
+		 * Only report; do not reprogram. chiron_touch.c owns these pins
+		 * and a second writer here would race it.
+		 */
+		printf("HWPROBE tlmm    : touch reset(gpio%u)=%#010x irq(gpio%u)=%#010x\n",
+		    HP_PIN_TOUCH_RESET, rst, HP_PIN_TOUCH_IRQ, irq);
+	}
+}
+
+static void
+hp_pmic(void)
+{
+	uint8_t rev0 = 0, rev1 = 0;
+
+	if (sweet_spmi_v1_init() != 0) {
+		printf("HWPROBE pmic    : no v1 SPMI arbiter; PM8998 not readable\n");
+		return;
+	}
+	/* PM8998 PERPH 0x01 revision register pair, SID 0. */
+	if (sweet_spmi_v1_read(0, 0x0100u, &rev0) != 0 ||
+	    sweet_spmi_v1_read(0, 0x0101u, &rev1) != 0) {
+		printf("HWPROBE pmic    : revision read failed\n");
+		return;
+	}
+	printf("HWPROBE pmic    : PM8998 revision %u.%u via %s\n",
+	    rev1, rev0, sweet_spmi_arb_name());
+}
+
+void
+sweet_hwprobe_run(void)
+{
+	int want = 0;
+
+	if (!PE_parse_boot_argn("sweethwprobe", &want, sizeof(want)) || want != 1) {
+		return;
+	}
+
+	printf("HWPROBE: read-only hardware report for %s\n",
+	    sweet_board_is_chiron() ? "chiron (MSM8998)" :
+	    (sweet_board_is_sweet() ? "sweet (SM7150)" : "unknown board"));
+	hp_mdss();
+	hp_ufs();
+	hp_usb();
+	hp_tlmm();
+	hp_pmic();
+	printf("HWPROBE: done (nothing was written)\n");
+}

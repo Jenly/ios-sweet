@@ -2,6 +2,42 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #10: first-boot hardware report (0087) <<<
+
+chiron has never run this kernel. On the first boot the only thing that matters
+is finding out **which blocks answered** -- and today that information is
+scattered across drivers that each probe one thing and print in their own format,
+several of which only run after the touch thread or the battery service starts. A
+boot that dies early therefore produces almost no information.
+
+`sweet_hwprobe.c` gathers one block of output, early, in a fixed order, before
+anything else can fail. It only READS.
+
+| block | what it prints | address source |
+|---|---|---|
+| MDSS | `MDP_HW_VERSION` split into major/minor/step | `msm8998-mdss.dtsi:17,58` |
+| UFS | CAP/VER/HCS/HCE, decoded to UFSHCI version, doorbell, UTRL ready | `msm8998.dtsi:1796` |
+| USB | DWC3 `GSNPSID` release, GCTL, DCFG, DSTS (speed + connected) | `msm8998.dtsi:1934` |
+| TLMM | touch reset (gpio 89) and IRQ (gpio 125) control registers | `chiron-msm8998-mtp.dtsi:236-237` |
+| PMIC | PM8998 revision pair via the v1 arbiter | `msm-pm8998.dtsi:18` |
+
+Every line says what the value *means*, not just its hex: "UFSHCI 2.1,
+doorbell=1 utrl_ready=1", "no doorbell -- the host is not running,
+sweet_ufs.c will not find a root device". A bare number is not a diagnosis.
+
+**Opt-in via `sweethwprobe=1` on purpose.** Reading an unclocked Qualcomm block
+usually returns zero, but on some interconnects a read to a gated block stalls the
+bus. The point is to make the first boot informative rather than risky, so the
+default is off and the first boot should pass the boot-arg.
+
+It runs at the top of UFS init, before any device access that can fail, and never
+writes: TLMM state is reported and explicitly not reprogrammed, because
+`chiron_touch.c` owns those pins and a second writer would race it.
+
+Verified: 0001-0087 applies with 0 failures, 10/10 TUs compile, 618/618 undefined
+symbols resolve with 0 orphans, header-export clean, drift check passes for all
+ten files the series creates, MDP5 register test still passes.
+
 ### >>> UPDATE 2026-10-20 #9: host test for the MDP5 register encoding <<<
 
 The touch driver's STOP-bit bug was caught by a host test of the wire protocol --
