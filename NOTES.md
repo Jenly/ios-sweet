@@ -2,6 +2,64 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #4: MDP5 hardware blit (patch 0084) <<<
+
+**GPU improvement wired in, behind a boot-arg, with a self-verifying safe mode.**
+
+`xnu/patches/0084-sweet-mdss-mdp5-blit.patch` (4 files, 747 lines) adds:
+
+- `bsd/dev/msm8998_mdss.c` + `.h` -- MDP5 writeback blit
+  (DMA0 SSPP -> LM0 -> WB) replacing the per-row memcpy in
+  `AppleCLCD::present()`.
+- `bsd/conf/files` entry.
+- `AppleCLCD::mdssVerify()` -- first-frame verification, see below.
+
+**Three boot-arg levels, and the default touches nothing:**
+
+| `sweetmdss=` | behaviour |
+|---|---|
+| absent / 0 | MDSS never mapped. Exactly today's behaviour. |
+| 1 | maps MDSS, **reads** MDP_HW_VERSION, logs major/minor/step. **Zero writes.** |
+| 2 | enables the blit, but verifies it before trusting it. |
+
+**The verification is the point.** With `sweetmdss=2` the first frame is still
+drawn by the CPU, so one scanline of the panel is known-correct; that row is
+saved, then the engine is asked to reproduce exactly it under each of eleven
+WB channel-selector candidates. A candidate that yields byte-identical pixels
+gets locked in and logged; if none does, the driver disables itself permanently
+and the CPU path continues. A wrong guess therefore costs a log line, not a
+broken display.
+
+**Why channel order is probed instead of derived:** this workspace's kernel has
+**no MDP5 writeback driver** -- `drivers/gpu/drm/msm/mdp/mdp5/` carries the
+register names but `__offset_WB` is inside `#if 0` ("TEMPORARY until patch that
+adds wb.base[] is merged"), `qcom,mdss-wb-off` is never parsed, and
+`qcom,mdss-wfd-mode` appears in the DTS with no code consuming it. The SDE
+driver in the same tree is the *next* generation and its `sde_hw_wb.c` offsets
+are not MDP5's. So the encoding is measured, not guessed.
+
+**Hardware facts confirmed, not assumed:**
+- chiron's display block is **MDP5, not SDE**: `xiaomi/chiron-msm8998-mtp.dtsi`
+  includes `msm8998-mdss.dtsi`, whose node is `compatible = "qcom,mdss_mdp"`.
+- `MDP_HW_VERSION` is at `mdp_phys + 0x1000 + 0` (`.mdp.base = { 0x01000 }` for
+  the 8x96 config in `mdp5_cfg.c`).
+- MDP5 addresses are 32-bit with no `_HI`, so both ends must be < 4 GiB --
+  checked at runtime (`getPhysicalSegment` length + high-word test) rather than
+  assumed from the memory map.
+- `SRC_FORMAT` for BGRA8888 = `0x000237FF`, `SRC_UNPACK` = `0x01000203`,
+  computed from the bitfields (`BPC8 = BPC8A = 3`,
+  `CPP(4-1)<<9`, `UNPACK_COUNT(4-1)<<12`, `PACK_TIGHT`) and the `FMT()` table.
+
+**Open risks, stated plainly:** whether the bootloader leaves the MDSS SMMU
+bypassed, and whether `qcom,mdss-wfd-mode = "intf"` means WB must be fed from
+the interface instead of a layer mixer. Either would make the blit fail -- which
+the verification reports cleanly. Nothing here has run on hardware.
+
+**Verified:** `0001-0084` applies with 0 failures; 10/10 files compile;
+611/611 symbols resolve, 0 orphans; header-export check clean (this is the check
+added after the run-1 failure); touch unit tests and patch-drift pass; sweet
+still presents 1125x2436 at 22,18 and chiron 1125x2436 at 22,0.
+
 ### >>> UPDATE 2026-10-20 #3: KERNEL BUILT SUCCESSFULLY (CI run 39289982773) <<<
 
 **`kernel.development.sweet` exists: 17,222,840 bytes, `Mach-O 64-bit arm64

@@ -1,0 +1,747 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/chiron_touch.c			standard
++bsd/dev/msm8998_mdss.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/msm8998_mdss.c b/bsd/dev/msm8998_mdss.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/msm8998_mdss.c
+@@ -0,0 +1,425 @@
++/*
++ * msm8998_mdss.c -- MDP5 hardware blit (DMA0 SSPP -> LM0 -> WB) for MSM8998.
++ *
++ * See msm8998_mdss.h for the safety model and for what is deliberately probed
++ * rather than assumed. This file is written so that the *default* configuration
++ * cannot damage a working display: it does nothing unless sweetmdss>=1, and
++ * with sweetmdss=1 it only reads one register.
++ *
++ * Register sources, all read from this workspace:
++ *   arch/arm64/boot/dts/qcom/msm8998-mdss.dtsi
++ *       :15   compatible = "qcom,mdss_mdp"
++ *       :17   reg = <0x0c900000 0x90000>, <0x0c9b0000 0x1040>
++ *       :58   qcom,mdss-mdp-reg-offset = <0x00001000>
++ *       :67   qcom,mdss-pipe-dma-off  = <0x25000 ...>
++ *       :91   qcom,mdss-ctl-off       = <0x2000 ...>
++ *       :93   qcom,mdss-mixer-intf-off = <0x45000 ...>
++ *       :96   qcom,mdss-wb-off        = <0x66000>
++ *   drivers/gpu/drm/msm/mdp/mdp5/mdp5.xml.h   register offsets and bitfields
++ *   drivers/gpu/drm/msm/mdp/mdp_common.xml.h  BPC8 = 3, BPC8A = 3,
++ *                                             MDP_PLANE_INTERLEAVED = 0,
++ *                                             CHROMA_FULL = 0
++ *   drivers/gpu/drm/msm/mdp/mdp_format.c      the FMT() table: BGRA8888 has
++ *                                             a=r=g=b=8, unpack {3,2,0,1},
++ *                                             alpha_enable, tight, cpp 4, cnt 4
++ *   drivers/gpu/drm/msm/mdp/mdp5/mdp5_cfg.c   .mdp.base = { 0x01000 } for the
++ *                                             8x96 config, i.e. MDP_HW_VERSION
++ *                                             lives at mdp_phys + 0x1000 + 0
++ *
++ * Derived constants (computed from the bitfields above, not guessed):
++ *   SRC_FORMAT for BGRA8888 = 0x000237FF
++ *       A_BPC(3)<<6 | R_BPC(3)<<4 | G_BPC(3)<<0 | B_BPC(3)<<2
++ *       | ALPHA_ENABLE | CPP(4-1)<<9 | UNPACK_COUNT(4-1)<<12 | PACK_TIGHT
++ *   SRC_UNPACK for BGRA8888 = 0x01000203   (e0=3, e1=2, e2=0, e3=1)
++ */
++
++#include <sys/param.h>
++#include <sys/types.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/malloc.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++#include "msm8998_mdss.h"
++
++/*
++ * machine/machine_routines.h declares ml_io_map only inside
++ * MACH_KERNEL_PRIVATE, which a BSD driver does not define; bsd/dev/chiron_touch.c
++ * declares it locally for the same reason.
++ */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/* ------------------------------------------------------------- addresses */
++
++#define MSM8998_MDSS_PA      0x0C900000u  /* msm8998-mdss.dtsi:17 */
++#define MSM8998_MDSS_SIZE    0x00090000u
++#define MSM8998_VBIF_PA      0x0C9B0000u
++#define MSM8998_VBIF_SIZE    0x00001040u
++
++/* Block bases, relative to MSM8998_MDSS_PA (msm8998-mdss.dtsi) */
++#define OFF_MDP_TOP          0x00001000u  /* :58  reg_offset */
++#define OFF_CTL0             0x00002000u  /* :91 */
++#define OFF_DMA0_SSPP        0x00025000u  /* :67 */
++#define OFF_LM0              0x00045000u  /* :93 */
++#define OFF_WB               0x00066000u  /* :96 */
++
++/* DMA0 SSPP registers (mdp5.xml.h, offsets inside the pipe block) */
++#define PIPE_SRC_SIZE        0x0000u
++#define PIPE_SRC_IMG_SIZE    0x0004u
++#define PIPE_SRC_XY          0x0008u
++#define PIPE_OUT_SIZE        0x000Cu
++#define PIPE_OUT_XY          0x0010u
++#define PIPE_SRC0_ADDR       0x0014u
++#define PIPE_SRC1_ADDR       0x0018u
++#define PIPE_SRC_STRIDE_A    0x0024u
++#define PIPE_SRC_STRIDE_B    0x0028u
++#define PIPE_SRC_FORMAT      0x0030u
++#define PIPE_SRC_UNPACK      0x0034u
++#define PIPE_SRC_OP_MODE     0x0038u
++
++/* LM0 registers (sde_hw_lm.c values, same offsets in mdp5.xml.h) */
++#define LM_OUT_SIZE          0x0004u
++#define LM_BLEND0_OP         0x0020u
++#define LM_BLEND0_FG_ALPHA   0x0024u
++#define LM_BLEND0_BG_ALPHA   0x0028u
++
++/* WB registers (mdp5.xml.h REG_MDP5_WB_*) */
++#define WB_DST_FORMAT        0x0000u
++#define WB_DST_OP_MODE       0x0004u
++#define WB_DST_PACK_PATTERN  0x0008u
++#define WB_DST0_ADDR         0x000Cu
++#define WB_DST_YSTRIDE0      0x001Cu
++#define WB_DST_WRITE_CONFIG  0x0048u
++#define WB_OUT_SIZE          0x0074u
++#define WB_ALPHA_X_VALUE     0x0078u
++
++/* CTL registers (mdp5.xml.h REG_MDP5_CTL_*) */
++#define CTL_LAYER0           0x0000u
++#define CTL_OP               0x0014u
++#define CTL_FLUSH            0x0018u
++#define CTL_START            0x001Cu
++
++/* WB_DST_FORMAT fields (mdp5.xml.h:1406-1450) */
++#define WB_FMT_DSTC0(v)      (((v) & 3u) << 0)
++#define WB_FMT_DSTC1(v)      (((v) & 3u) << 2)
++#define WB_FMT_DSTC2(v)      (((v) & 3u) << 4)
++#define WB_FMT_DSTC3(v)      (((v) & 3u) << 6)
++#define WB_FMT_DST_BPP(v)    (((v) & 3u) << 9)
++#define WB_FMT_PACK_COUNT(v) (((v) & 3u) << 12)
++#define WB_FMT_PACK_TIGHT    0x00020000u
++
++/* CTL_FLUSH bits (mdp5.xml.h:469-497) */
++#define FLUSH_DMA0           0x00000800u
++#define FLUSH_LM0            0x00000040u
++#define FLUSH_WB             0x00010000u
++#define FLUSH_CTL            0x00020000u
++#define FLUSH_ALL_USED       (FLUSH_DMA0 | FLUSH_LM0 | FLUSH_WB | FLUSH_CTL)
++
++/* CTL_OP: mode 2 is WB 2-line (mdp5_ctl.c set_ctl_op); no INTF, virtual pipe */
++#define CTL_OP_WB_2_LINE     2u
++
++/* A byte-identical BGRA8888 -> BGRA8888 copy should need this. */
++#define SRC_FORMAT_BGRA8888  0x000237FFu
++#define SRC_UNPACK_BGRA8888  0x01000203u
++#define WB_BPP_8             3u
++#define WB_PACK_COUNT_4      3u
++
++/* ---------------------------------------------------------------- state */
++
++static vm_offset_t s_mdss;
++static vm_offset_t s_vbif;
++static int         s_state = SWEET_MDSS_OFF;
++static int         s_sleep_chan;
++static uint32_t    s_dstc;
++static uint64_t    s_blits;
++static uint64_t    s_timeouts;
++static uint64_t    s_failures;
++static boolean_t   s_disable_logged;
++
++/*
++ * Channel-selector candidates, tried in order by the caller's verification.
++ * Index 0 is the identity mapping (c0..c3 = 0,1,2,3), which is what a copy that
++ * preserves byte order should need; index 1 is all-zero, the other obvious
++ * encoding. The rest are permutations, so one boot can identify the real
++ * encoding without a rebuild.
++ */
++static const uint8_t s_dstc_candidates[] = {
++	0xE4,  /* c0=0 c1=1 c2=2 c3=3  identity                */
++	0x00,  /* c0=0 c1=0 c2=0 c3=0  all from the same plane */
++	0x24,  /* c0=0 c1=1 c2=2 c3=0                          */
++	0x1B,  /* c0=3 c1=2 c2=1 c3=0                          */
++	0x6C,  /* c0=0 c1=3 c2=2 c3=1                          */
++	0x93,  /* c0=3 c1=0 c2=1 c3=2                          */
++	0x39,  /* c0=1 c1=2 c2=3 c3=0                          */
++	0x4E,  /* c0=2 c1=3 c2=0 c3=1                          */
++	0xB1,  /* c0=1 c1=0 c2=3 c3=2                          */
++	0xD2,  /* c0=2 c1=0 c2=3 c3=3                          */
++	0xFF,  /* everything to plane 3                        */
++};
++
++/* --------------------------------------------------------------- helpers */
++
++static uint32_t
++md_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(s_mdss + off);
++}
++
++static void
++md_wr(uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(s_mdss + off) = val;
++}
++
++static void
++md_wait_ms(unsigned ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&s_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---------------------------------------------------------------- probe */
++
++int
++sweet_mdss_state(void)
++{
++	return s_state;
++}
++
++int
++sweet_mdss_ready(void)
++{
++	return s_state == SWEET_MDSS_ACTIVE;
++}
++
++uint32_t
++sweet_mdss_set_dstc(uint32_t field)
++{
++	s_dstc = field & 0xFFu;
++	return s_dstc;
++}
++
++uint32_t
++sweet_mdss_dstc(void)
++{
++	return s_dstc;
++}
++
++int
++sweet_mdss_dstc_candidate(uint32_t index)
++{
++	if (index >= sizeof(s_dstc_candidates)) {
++		return -1;
++	}
++	s_dstc = s_dstc_candidates[index];
++	return (int)s_dstc;
++}
++
++int
++sweet_mdss_init(void)
++{
++	int     want = 0;
++	uint32_t ver, major, minor, step;
++
++	if (s_state != SWEET_MDSS_OFF) {
++		return s_state == SWEET_MDSS_FAILED ? -1 : 0;
++	}
++
++	if (!PE_parse_boot_argn("sweetmdss", &want, sizeof(want)) || want <= 0) {
++		/* Default: leave the display block completely alone. */
++		return -1;
++	}
++
++	s_mdss = ml_io_map(MSM8998_MDSS_PA, MSM8998_MDSS_SIZE);
++	if (s_mdss == 0) {
++		printf("SWEET MDSS: cannot map MDP at %#x\n", MSM8998_MDSS_PA);
++		s_state = SWEET_MDSS_FAILED;
++		return -1;
++	}
++
++	/*
++	 * The single cheapest experiment in this driver: if MDP_HW_VERSION reads
++	 * as a plausible major/minor, the block is clocked and our mapping and
++	 * block offset are both right. If it reads 0 or all-ones, nothing below
++	 * is worth attempting.
++	 */
++	ver = md_rd(OFF_MDP_TOP + 0x0000u);
++	major = (ver >> 28) & 0xF;
++	minor = (ver >> 16) & 0xFFFu;
++	step = ver & 0xFFFFu;
++
++	if (ver == 0 || ver == 0xFFFFFFFFu || major == 0) {
++		printf("SWEET MDSS: MDP_HW_VERSION=%#x looks dead "
++		    "(major=%u minor=%u step=%u); not touching the pipeline\n",
++		    ver, major, minor, step);
++		s_state = SWEET_MDSS_FAILED;
++		return -1;
++	}
++
++	printf("SWEET MDSS: MDP_HW_VERSION=%#x major=%u minor=%u step=%u\n",
++	    ver, major, minor, step);
++
++	if (want == 1) {
++		/* Probe only: deliberately zero writes. */
++		s_state = SWEET_MDSS_PROBE_ONLY;
++		printf("SWEET MDSS: probe-only (sweetmdss=1); "
++		    "set sweetmdss=2 to enable the blit\n");
++		return 0;
++	}
++
++	s_vbif = ml_io_map(MSM8998_VBIF_PA, MSM8998_VBIF_SIZE);
++	if (s_vbif == 0) {
++		/* Not fatal: the blit does not program VBIF yet. */
++		printf("SWEET MDSS: VBIF map failed (continuing)\n");
++	}
++
++	s_state = SWEET_MDSS_ACTIVE;
++	printf("SWEET MDSS: blit enabled (sweetmdss=%d), dstc=%#x initially\n",
++	    want, s_dstc);
++	return 0;
++}
++
++/* ------------------------------------------------------------- the blit */
++
++int
++sweet_mdss_blit(uint32_t src_phys, uint32_t src_stride,
++    uint32_t dst_phys, uint32_t dst_stride,
++    uint32_t w, uint32_t h,
++    uint32_t src_x, uint32_t src_y,
++    uint32_t dst_x, uint32_t dst_y)
++{
++	uint32_t size, src_img, src_xy, out_xy;
++	uint32_t wb_fmt;
++
++	if (s_state != SWEET_MDSS_ACTIVE) {
++		return -1;
++	}
++	if (w == 0 || h == 0 || w > 0xFFFFu || h > 0xFFFFu) {
++		return -1;
++	}
++	/* Single 32-bit address registers: both ends must live below 4 GiB. */
++	if (src_phys == 0 || dst_phys == 0 ||
++	    (src_phys >> 32) != 0 || (dst_phys >> 32) != 0) {
++		return -1;
++	}
++	if (src_stride < w * 4u || dst_stride < w * 4u) {
++		return -1;
++	}
++
++	size    = (h << 16) | w;
++	src_img = (h << 16) | w;      /* no scaling: image == output */
++	src_xy  = ((src_y & 0xFFFFu) << 16) | (src_x & 0xFFFFu);
++	out_xy  = ((dst_y & 0xFFFFu) << 16) | (dst_x & 0xFFFFu);
++
++	/* ---- source pipe: linear BGRA8888, no scaling, no flip ---- */
++	md_wr(OFF_DMA0_SSPP + PIPE_SRC_IMG_SIZE, src_img);
++	md_wr(OFF_DMA0_SSPP + PIPE_SRC_XY, src_xy);
++	md_wr(OFF_DMA0_SSPP + PIPE_SRC_SIZE, size);
++	md_wr(OFF_DMA0_SSPP + PIPE_OUT_XY, out_xy);
++	md_wr(OFF_DMA0_SSPP + PIPE_OUT_SIZE, size);
++	md_wr(OFF_DMA0_SSPP + PIPE_SRC_STRIDE_A, src_stride & 0xFFFFu);
++	md_wr(OFF_DMA0_SSPP + PIPE_SRC_STRIDE_B, 0);
++	md_wr(OFF_DMA0_SSPP + PIPE_SRC0_ADDR, src_phys);
++	md_wr(OFF_DMA0_SSPP + PIPE_SRC1_ADDR, 0);
++	md_wr(OFF_DMA0_SSPP + PIPE_SRC_FORMAT, SRC_FORMAT_BGRA8888);
++	md_wr(OFF_DMA0_SSPP + PIPE_SRC_UNPACK, SRC_UNPACK_BGRA8888);
++	md_wr(OFF_DMA0_SSPP + PIPE_SRC_OP_MODE, 0);
++
++	/* ---- layer mixer: opaque stage-0 copy over the rectangle ---- */
++	md_wr(OFF_LM0 + LM_OUT_SIZE,
++	    (((dst_y + h) & 0xFFFFu) << 16) | ((dst_x + w) & 0xFFFFu));
++	md_wr(OFF_LM0 + LM_BLEND0_FG_ALPHA, 0xFFu);
++	md_wr(OFF_LM0 + LM_BLEND0_BG_ALPHA, 0u);
++	md_wr(OFF_LM0 + LM_BLEND0_OP, 0u);
++
++	/* ---- writeback destination: same 32-bpp layout as the source ---- */
++	wb_fmt = WB_FMT_DSTC0(s_dstc & 3u) |
++	    WB_FMT_DSTC1((s_dstc >> 2) & 3u) |
++	    WB_FMT_DSTC2((s_dstc >> 4) & 3u) |
++	    WB_FMT_DSTC3((s_dstc >> 6) & 3u) |
++	    WB_FMT_DST_BPP(WB_BPP_8) |
++	    WB_FMT_PACK_COUNT(WB_PACK_COUNT_4) |
++	    WB_FMT_PACK_TIGHT;
++
++	md_wr(OFF_WB + WB_DST_FORMAT, wb_fmt);
++	md_wr(OFF_WB + WB_DST_OP_MODE, 0);
++	md_wr(OFF_WB + WB_DST_PACK_PATTERN, 0);
++	md_wr(OFF_WB + WB_DST0_ADDR, dst_phys + dst_y * dst_stride + dst_x * 4u);
++	md_wr(OFF_WB + WB_DST_YSTRIDE0, dst_stride & 0xFFFFu);
++	md_wr(OFF_WB + WB_OUT_SIZE, size);
++	md_wr(OFF_WB + WB_ALPHA_X_VALUE, 0xFFu);
++
++	/*
++	 * ---- commit ----
++	 * Same order mdp5_ctl.c uses (:519-530): flush the blocks, then kick
++	 * CTL_START. CTL_OP selects WB 2-line mode with no interface number,
++	 * because this is a virtual (writeback) pipeline.
++	 */
++	md_wr(OFF_CTL0 + CTL_LAYER0, 0);
++	md_wr(OFF_CTL0 + CTL_OP, CTL_OP_WB_2_LINE);
++	md_wr(OFF_CTL0 + CTL_FLUSH, FLUSH_ALL_USED);
++	md_wr(OFF_CTL0 + CTL_START, 1);
++
++	s_blits++;
++	return 0;
++}
++
++int
++sweet_mdss_wait_idle(uint32_t timeout_us)
++{
++	uint64_t deadline, now;
++	uint32_t left;
++
++	if (s_state != SWEET_MDSS_ACTIVE) {
++		return -1;
++	}
++	if (timeout_us == 0) {
++		timeout_us = 20000;   /* 20 ms, a bit more than one 60 Hz frame */
++	}
++
++	/*
++	 * FLUSH is write-1-to-clear per bit in this block, so a successful
++	 * commit leaves it at zero. Poll it rather than trusting the write.
++	 */
++	clock_interval_to_deadline(timeout_us, NSEC_PER_USEC, &deadline);
++	for (;;) {
++		left = md_rd(OFF_CTL0 + CTL_FLUSH) & FLUSH_ALL_USED;
++		if (left == 0) {
++			return 0;
++		}
++		now = mach_absolute_time();
++		if (now > deadline) {
++			s_timeouts++;
++			return -1;
++		}
++		md_wait_ms(1);
++	}
++}
++
++void
++sweet_mdss_disable(const char *why)
++{
++	if (s_state == SWEET_MDSS_ACTIVE) {
++		s_failures++;
++	}
++	s_state = SWEET_MDSS_FAILED;
++	if (!s_disable_logged) {
++		s_disable_logged = TRUE;
++		printf("SWEET MDSS: disabled permanently: %s\n",
++		    why != NULL ? why : "(no reason given)");
++	}
++}
++
++void
++sweet_mdss_stats(void)
++{
++	printf("SWEET MDSS: state=%d blits=%llu timeouts=%llu failures=%llu dstc=%#x\n",
++	    s_state, s_blits, s_timeouts, s_failures, s_dstc);
++}
+diff --git a/bsd/dev/msm8998_mdss.h b/bsd/dev/msm8998_mdss.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/msm8998_mdss.h
+@@ -0,0 +1,105 @@
++/*
++ * msm8998_mdss.h -- MDP5 hardware blit for the ios-sweet XNU port.
++ *
++ * Scope: MSM8998 (chiron / Mi MIX 2) only. That SoC's board file includes
++ * msm8998-mdss.dtsi, whose MDP node is `compatible = "qcom,mdss_mdp"` -- the
++ * MDP5 generation, not SDE. Verified at
++ * arch/arm64/boot/dts/qcom/xiaomi/chiron-msm8998-mtp.dtsi.
++ *
++ * What it does: copies a 32-bpp rectangle from one physical address to another
++ * through the MDP5 writeback path (DMA0 SSPP -> LM0 -> WB), replacing the
++ * per-row CPU memcpy in AppleCLCD::present(). The CPU then writes ~25
++ * registers per frame instead of touching every pixel.
++ *
++ * SAFETY MODEL -- read before enabling.
++ *   * Off by default. sweetmdss absent or 0: the block is never mapped.
++ *   * sweetmdss=1 probes only: maps MDSS, reads MDP_HW_VERSION, logs it, and
++ *     performs no writes at all. This is how the first boot learns whether the
++ *     block is clocked and whether the mapping is right.
++ *   * sweetmdss=2 enables the blit, but the CALLER MUST VERIFY it: copy the
++ *     first frame with the CPU, keep a reference, blit with hardware, compare.
++ *     On mismatch call sweet_mdss_disable() with the reason. The driver has no
++ *     copy of the pixels and cannot verify itself.
++ *
++ * WHY ADDRESSES MUST BE BELOW 4 GiB:
++ *   MDP5's source and destination address registers are single 32-bit words
++ *   (MDP5_PIPE_SRC0_ADDR, MDP5_WB_DST0_ADDR); there is no _HI companion. Both
++ *   come from msm8998's low window (RAM 0xa0000000 + 0x60000000, panel memory
++ *   0x9d400000), so this holds by construction.
++ *
++ * WHAT IS UNKNOWN AND THEREFORE PROBED, NOT ASSUMED:
++ *   * Whether the bootloader leaves the MDSS SMMU bypassed. If MDP5 fetches
++ *     through an unset translation the blit writes garbage -- which the
++ *     caller's comparison catches.
++ *   * The WB output channel order. WB_DST_FORMAT's DSTC0..3 fields (2 bits
++ *     each) select which component reaches each output byte; the kernel in
++ *     this workspace has no MDP5 writeback driver to copy the encoding from
++ *     (drivers/gpu/drm/msm/mdp/mdp5 has the register names only -- __offset_WB
++ *     is compiled out with `#if 0`, and qcom,mdss-wb-off is never parsed), so
++ *     the encoding is discovered by trying candidates and keeping the one that
++ *     reproduces the reference bytes.
++ *   * Whether `qcom,mdss-wfd-mode = "intf"` (msm8998-mdss.dtsi) means WB must
++ *     be fed from the interface rather than a layer mixer. If so this will not
++ *     produce the rectangle and verification will disable it -- which rules the
++ *     approach out cleanly rather than silently corrupting the panel.
++ */
++
++#ifndef _BSD_DEV_MSM8998_MDSS_H_
++#define _BSD_DEV_MSM8998_MDSS_H_
++
++#include <sys/types.h>
++
++/* sweet_mdss_state() values */
++#define SWEET_MDSS_OFF         0  /* not mapped, not touched            */
++#define SWEET_MDSS_PROBE_ONLY  1  /* mapped, HW_VERSION read, no writes */
++#define SWEET_MDSS_ACTIVE      2  /* blit permitted                     */
++#define SWEET_MDSS_FAILED      3  /* mapped but permanently disabled    */
++
++/*
++ * Map MDSS and read MDP_HW_VERSION. Idempotent.
++ * Returns 0 if the block answered sensibly (state PROBE_ONLY or ACTIVE),
++ * negative if MDSS could not be mapped or the version register looked dead.
++ */
++int sweet_mdss_init(void);
++
++int sweet_mdss_state(void);
++
++/* 1 if a hardware blit may be attempted for this frame. */
++int sweet_mdss_ready(void);
++
++/*
++ * Blit one 32-bpp rectangle; every address is physical and must be < 4 GiB.
++ * (src_x, src_y) is the top-left inside the source, (dst_x, dst_y) on the
++ * panel. Returns 0 when the commit was issued, negative otherwise.
++ */
++int sweet_mdss_blit(uint32_t src_phys, uint32_t src_stride,
++    uint32_t dst_phys, uint32_t dst_stride,
++    uint32_t w, uint32_t h,
++    uint32_t src_x, uint32_t src_y,
++    uint32_t dst_x, uint32_t dst_y);
++
++/*
++ * WB destination channel selectors. `field` is the raw 8-bit value packing
++ * DSTC0..DSTC3 as (c0 | c1<<2 | c2<<4 | c3<<6). Returns what was stored.
++ */
++uint32_t sweet_mdss_set_dstc(uint32_t field);
++uint32_t sweet_mdss_dstc(void);
++
++/*
++ * Select candidate channel-selector index (0..n-1) and return its field value,
++ * or -1 when index is past the end. Candidate 0 is the identity mapping, which
++ * is what a byte-identical copy should need; the caller walks the list and
++ * keeps the first that reproduces its reference bytes.
++ */
++int sweet_mdss_dstc_candidate(uint32_t index);
++
++/* Wait until the commit's flush bits are consumed. 0 ok, -1 timeout. */
++int sweet_mdss_wait_idle(uint32_t timeout_us);
++
++/* Disable permanently, logging `why` once. */
++void sweet_mdss_disable(const char *why);
++
++/* Log blit/timeout/failure counters. */
++void sweet_mdss_stats(void);
++
++#endif /* _BSD_DEV_MSM8998_MDSS_H_ */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,6 +39,23 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
++/*
++ * MDP5 writeback blit (bsd/dev/msm8998_mdss.c). Declared here rather than
++ * included because msm8998_mdss.h lives under bsd/dev/ and this file is built
++ * with IOKit's include list. Every one of these is a no-op until the boot-arg
++ * sweetmdss=2 is given; see the header for the safety model.
++ */
++extern "C" int  sweet_mdss_init(void);
++extern "C" int  sweet_mdss_state(void);
++extern "C" int  sweet_mdss_ready(void);
++extern "C" int  sweet_mdss_blit(uint32_t src_phys, uint32_t src_stride,
++    uint32_t dst_phys, uint32_t dst_stride, uint32_t w, uint32_t h,
++    uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y);
++extern "C" int  sweet_mdss_dstc_candidate(uint32_t index);
++extern "C" int  sweet_mdss_wait_idle(uint32_t timeout_us);
++extern "C" void sweet_mdss_disable(const char *why);
++extern "C" void sweet_mdss_stats(void);
++
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+@@ -118,11 +135,21 @@
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
++	/* MDP5 hardware blit state; all inert unless sweetmdss=2. */
++	bool          fMdssOk;        /* engine initialised and permitted   */
++	bool          fMdssVerified;  /* first-frame comparison passed      */
++	void         *fMdssRef;       /* one scanline of reference pixels   */
++	uint32_t      fMdssRefLen;
++	uint64_t      fMdssBlits;
++	uint64_t      fMdssFails;
++
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	bool mdssVerify(uint32_t srcPhys, uint32_t srcStride, uint32_t dstPhys,
++	    int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -186,6 +213,24 @@
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	/*
++	 * Ask the MDP5 driver whether it is allowed to run. Returns non-zero
++	 * only when sweetmdss=2 was given and MDP_HW_VERSION looked alive; a
++	 * boot without the boot-arg never touches the display block.
++	 */
++	fMdssOk = (sweet_mdss_init() == 0) && sweet_mdss_ready();
++	fMdssRefLen = fWidth * 4u;
++	if (fMdssOk) {
++		fMdssRef = IOMalloc(fMdssRefLen);
++		if (fMdssRef == NULL) {
++			fMdssOk = false;
++			sweet_mdss_disable("cannot allocate the verification row");
++		}
++	}
++	IOLog("SWEET FB: MDP5 blit %s (state %d)\n",
++	    fMdssOk ? "armed, will verify on the first frame" : "off",
++	    sweet_mdss_state());
++
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -391,14 +436,117 @@
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			bool blitted = false;
++
++			/*
++			 * Try the MDP5 writeback engine first. It needs a physically
++			 * contiguous source with the surface's stride and both
++			 * addresses below 4 GiB (MDP5's address registers are 32-bit
++			 * with no _HI), so all of that is checked here rather than
++			 * assumed.
++			 */
++			if (fMdssOk) {
++				IOByteCount segLen = 0;
++				uint64_t    need = (uint64_t)(h - 1) * s->bytesPerRow +
++				    (uint64_t)w * 4;
++				addr64_t    srcPhys = s->memory->getPhysicalSegment(
++				    s->offset + (IOByteCount)sy * s->bytesPerRow +
++				    (IOByteCount)sx * 4, &segLen, kIOMemoryMapperNone);
++
++				if (srcPhys == 0 || (uint64_t)segLen < need ||
++				    fPhys == 0 || ((uint64_t)srcPhys >> 32) != 0 ||
++				    ((uint64_t)fPhys >> 32) != 0) {
++					/* Not a candidate for hardware: CPU path. */
++				} else {
++					if (!fMdssVerified &&
++					    !mdssVerify((uint32_t)srcPhys, s->bytesPerRow,
++					    (uint32_t)fPhys, sx, sy, dx, dy, w)) {
++						fMdssOk = false;
++					}
++					if (fMdssVerified &&
++					    sweet_mdss_blit((uint32_t)srcPhys,
++					    s->bytesPerRow, (uint32_t)fPhys, fRowBytes,
++					    (uint32_t)w, (uint32_t)h,
++					    (uint32_t)sx, (uint32_t)sy,
++					    (uint32_t)dx, (uint32_t)dy) == 0) {
++						blitted = true;
++						fMdssBlits++;
++						if ((fMdssBlits % 600) == 0) {
++							(void)sweet_mdss_wait_idle(0);
++							sweet_mdss_stats();
++						}
++					}
++				}
+ 			}
++			if (!blitted) {
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (size_t)w * 4);
++				}
++				fMdssFails++;
++			}
+ 		}
+ 		s->release();
+ 	}
++}
++
++/*
++ * First-frame verification of the MDP5 blit.
++ *
++ * The caller has already drawn this rectangle on the CPU, so one scanline of
++ * the destination is known to be correct. Keep it, then ask the engine to
++ * reproduce exactly that scanline under each channel-selector candidate. A
++ * candidate that yields byte-identical pixels is the right encoding and gets
++ * locked in; if none does, the engine is disabled and the CPU path continues.
++ *
++ * Always restores the reference row before returning, so this cannot leave the
++ * panel showing test pixels.
++ */
++bool
++AppleCLCD::mdssVerify(uint32_t srcPhys, uint32_t srcStride, uint32_t dstPhys,
++    int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w)
++{
++	uint32_t  rowBytes = (uint32_t)w * 4u;
++	uintptr_t dstRow;
++	int32_t   tried = 0;
++
++	if (fMdssRef == NULL || w <= 0 || dx < 0 || dy < 0 ||
++	    rowBytes > fMdssRefLen) {
++		sweet_mdss_disable("no usable reference row for the first-frame check");
++		return false;
++	}
++	dstRow = fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
++	memcpy(fMdssRef, (const void *)dstRow, rowBytes);
++
++	for (;;) {
++		int field = sweet_mdss_dstc_candidate((uint32_t)tried);
++
++		if (field < 0) {
++			break;
++		}
++		tried++;
++		/* Reference back, engine writes the row, compare. */
++		memcpy((void *)dstRow, fMdssRef, rowBytes);
++		if (sweet_mdss_blit(srcPhys, srcStride, dstPhys, fRowBytes,
++		    (uint32_t)w, 1, (uint32_t)sx, (uint32_t)sy,
++		    (uint32_t)dx, (uint32_t)dy) != 0) {
++			break;
++		}
++		(void)sweet_mdss_wait_idle(0);
++		if (memcmp((const void *)dstRow, fMdssRef, rowBytes) == 0) {
++			IOLog("SWEET FB: MDP5 blit verified, dstc=%#x after %d candidate(s)\n",
++			    (uint32_t)field, tried);
++			return true;
++		}
++	}
++
++	memcpy((void *)dstRow, fMdssRef, rowBytes);
++	IOLog("SWEET FB: MDP5 blit could not reproduce the pixels in %d candidate(s); "
++	    "staying on the CPU path\n", tried);
++	sweet_mdss_stats();
++	sweet_mdss_disable("first-frame comparison failed");
++	return false;
+ }
+ 
+ bool
