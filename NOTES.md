@@ -2,6 +2,39 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #6: PMIC arbiter v1 port (0085) <<<
+
+**A real cross-SoC incompatibility, found by auditing rather than by a crash.**
+
+The battery path was gated to SM7150 by patch 0082, with an honest message:
+"not an SM7150 board, no fuel-gauge readout". That gate was correct, because
+`sweet_spmi.c` speaks the **v5** PMIC-arbiter protocol at SM7150 addresses:
+
+    core 0x0c440000, observer 0x0e600000, config 0x0c40a000
+    APID map at core + 0x900 + 4n, command ignores SID
+
+MSM8998 uses **v1** (`msm8998.dtsi:593`):
+
+    core 0x0800f000, chnls 0x8400000, obsrvr 0x9400000, cnfg 0x0800a000
+    observer channel at 0x800 + 0x80*channel   (spmi-pmic-arb.c:890)
+    APID map at core + 0x800 + 4n              (channel_map_offset_v2)
+    command = opc<<27 | (sid&0xf)<<20 | addr<<4 | bc   (fmt_cmd_v1:1096)
+
+Pointing the v5 code at MSM8998 would put the observer base inside the "chnls"
+window and walk non-existent memory as an APID table. Only the per-channel
+register block (`+0x00 CMD`, `+0x08 STATUS`, `+0x18 RDATA0`) is common.
+
+New: `bsd/dev/sweet_spmi_v1.{c,h}` -- the v1 read path, read-only by
+construction (the only command ever issued is EXT_READL, opcode 1; no write
+path, no interrupt clear, no peripheral config, because the PMIC also powers the
+CPU rails). `SweetBattery.cpp` now probes the version register and installs the
+matching read function, instead of gating on the board name; if neither arbiter
+answers it publishes the static power source and says so.
+
+Verified: 0001-0085 applies with 0 failures, 10/10 TUs compile, 615/615
+undefined symbols resolve with 0 orphans, header-export check clean, touch
+tests pass, sweet's display geometry unchanged. Not run on hardware.
+
 ### >>> UPDATE 2026-10-20 #5: GPU blit MERGED and building; UEFI app shipped <<<
 
 **1. MDP5 hardware blit is in the kernel and CI-green.**
