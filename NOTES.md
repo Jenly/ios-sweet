@@ -2,6 +2,56 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #12: UEFI menu chainloads real EFI images <<<
+
+`sweet-uefi` no longer just explains why it cannot boot anything. Every `.efi`
+on the boot volume is a menu entry, launched through the standard UEFI mechanism:
+
+```
+LoadImage(TRUE, self, file_device_path, NULL, 0, &handle);
+StartImage(handle, NULL, NULL);
+```
+
+The device path is built the way edk2's `FileDevicePath()` does it -- the volume's
+own path with its END node replaced by a MEDIA_FILEPATH node -- so `LoadImage`
+resolves the file through the Simple File System protocol. When the launched image
+returns, control comes back, which is what makes this a menu rather than a
+one-way jump. Search order: `\sweet\*.efi` then `\*.efi`.
+
+**The XNU kernel is still not chainloaded, deliberately.** It is a Mach-O payload
+that `shim/loader.c` copies into place and enters with the MMU off. Doing that in
+the launcher would duplicate reviewed code and move the segment copy and MMU
+transition into it. That row reports what it found and says where the handoff
+happens; once the shim is an EFI application it appears in the menu and boots
+through the path above with no change.
+
+**Three bugs found by looking at the rendered menu, not the code:**
+
+1. `UI_MAX_ITEMS` was 6 while the scanner can find 8 images -- and because main.c
+   reserves four slots for its fixed rows, the guard silently limited the menu to
+   **two** bootable entries. Raised to 12, guard corrected.
+2. The accent rule sat at a fixed `H/8`. A taller card lifts the title, so with
+   eight entries the rule landed under the subtitle looking like a stray
+   underline. Now positioned from the title.
+3. Clamping `card_h` alone left rows drawing past the card's bottom edge, because
+   their positions derive from `row_h`. The rows shrink instead now.
+
+**And a new host test with teeth.** `tests/chain_devpath_test.c` compiles
+`chain.c` unchanged against the real `efi.h` and checks UEFI 2.10 ch.10.3's
+invariants on the produced path: every node length includes its 4-byte header, the
+nodes exactly tile the buffer, the volume prefix survives byte for byte, the
+FILEPATH node carries a NUL-terminated UTF-16 name, exactly one END node exists.
+72 checks.
+
+Verified able to fail by injecting three bugs one at a time -- volume END not
+dropped, FILEPATH length excluding the NUL, node length written big-endian -- each
+caught with a specific message. My first verification run reported "not caught"
+for two of them; that was a bug in the probe script (`grep` inside `set -o
+pipefail` makes the exit status meaningless), not in the test.
+
+`./test.sh` now has four gates and runs in CI (run `39312645441`: success):
+build+format, layout at 4 and 8 entries, `efi.h` field offsets, device paths.
+
 ### >>> UPDATE 2026-10-20 #11: USB per-SoC table (0088) <<<
 
 `sweet_usb.c` had SM7150's USB addresses hardcoded and returned early on every
