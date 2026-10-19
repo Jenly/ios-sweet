@@ -109,20 +109,93 @@ kernel* in IOKit personalities, not inferred from userland. `ipsw kernel dec`
 expands it to a 50,937,856-byte Mach-O; `ipsw kernel kexts --json` lists all
 239 kexts. This is the single highest-value 18 MB in the whole IPSW.
 
-### 1.3 The dyld shared cache
+### 1.3 The dyld shared cache -- **correction: it is in the SystemOS cryptex, not the rootfs**
 
-Lives **only** inside `087-86698-044.dmg` (there is no standalone cache member
-in an iOS 16.7 restore). The DMG is Apple's newer `bvxn` container (magic
-`62 76 78 6e` at offset 0) wrapping an EFI/GPT disk; `ipsw disk dmg <file>`
-lists/extracts partitions and `ipsw mount fs` mounts the HFS+ volume. Per the
-project convention (NOTES.md:223) the cache must live in a **writable**
-directory because `ipsw` writes its `.a2s` address-symbol cache next to it --
-hence `/root/dsc/`, not `/root/ios-sweet/research`.
+This is worth stating plainly because it inverts the obvious plan. On 20H392 the
+dyld shared cache is **not** in `087-86698-044.dmg` (the root filesystem). It is
+in **`087-86593-047.dmg`**, identity `Cryptex1,SystemOS`, and `ipsw` itself says
+so: `ipsw extract --remote <URL> --dyld -a arm64` prints
+`Extracting /tmp/-/087-86593-047.dmg`. Trying to find it in the 4.73 GB rootfs
+DMG is wasted effort.
 
-*This section is completed in -2.1a / -2.3a / -2.4a below if the pull finished;
-if those subsections are headed "not reached", the DMG did not land within the
-session and the QuartzCore/Metal/AGXMetalA11 answers are limited to what -2.2
-can prove from the kernel side.*
+That DMG is 2 743 074 816 bytes uncompressed / 1 097 727 251 bytes deflated
+(method 8), so pulling it costs **1.1 GB down / 2.74 GB on disk** -- six times
+cheaper than the rootfs. It was fetched with `tools/remotezip.py`
+(CRC-32 verified, `087-86593-047.dmg: 2743074816 bytes, CRC-32 ok`).
+
+Container and volume:
+
+```
+$ xxd -l 64 087-86593-047.dmg
+00000000: 8521 6704 f4a7 ed20 0100 0000 0000 0000  .!g.... ........
+00000010: 1800 0000 0000 0000 0100 0080 0000 0000
+00000020: 4e58 5342 0010 0000 0038 0a00 0000 0000  NXSB.....8......
+
+$ fsapfsinfo 087-86593-047.dmg          # libfsapfs-utils 20201107
+Container information:
+	Identifier			: 07490cba-83ee-4f50-a415-3de222723455
+	Number of volumes		: 1
+Volume: 1 information:
+	Identifier			: 96096b28-b6dc-4bc7-9d3a-2632a0fe53f1
+	Name				: SydneyUpdate20H392.D22D221SystemCryptex
+	Incompatible features		: 0x00000028
+```
+
+`NXSB` = APFS container superblock, single volume, the D22/D221 system cryptex.
+`libfsapfs`'s directory walk fails on this volume
+(`libfsapfs_file_system_btree_get_root_node: unable to read B-tree node`), and
+`ipsw` refuses it for want of `apfs-fuse`. **Neither was needed**: the cache is
+carved by its own magic instead (-1.4).
+
+### 1.4 How the cache was actually extracted (no APFS parser required)
+
+Every dyld cache file starts with `dyld_v1` followed by a header whose
+`mappingOffset`/`mappingCount`/`codeSignatureOffset`/`codeSignatureSize` fields
+give that file's exact extent. Scanning the raw 2.74 GB image for the magic,
+validating each candidate header, and sorting by base address yields **41
+blobs**. The main cache then names its subcaches in a `{uuid[16], size u64,
+fileSuffix[32]}` array; decoding it (`dsc_refs.py`) shows 40 records at a
+**56-byte stride** (not the 48 the struct would suggest -- 16 + 8 + 32), listed
+in ascending-VA order, with suffixes `.01`, `.02`, - `.40`.
+
+Result (`carve_dsc.py`), each file's size cross-checked against its *own*
+header as `codeSignatureOffset + codeSignatureSize`:
+
+| | |
+|---|---|
+| files | **41** (`dyld_shared_cache_arm64` + `.01`-`.40`) |
+| total | **2 384 232 448 bytes = 2.22 GiB** |
+| main cache | `dyld_shared_cache_arm64`, 393 216 bytes, base `0x180000000`, uuid `8f970452` |
+| VA span | `0x180000000` - `0x212fe4000` |
+| images | **3 026** Mach-O images across the subcaches (counted by `LC_ID_DYLIB`) |
+| per-file check | `dsc_check.py`: every one of the 41 reports `disk == cs_end`, i.e. `OK` |
+
+The largest subcaches are ~115 MB each (`.01` `.03` `.05` - `.34` `.36`), with a
+few small "symbol/objc-opt" subcaches of 100-600 KB between them -- that
+alternation is the layout, not an artefact.
+
+Location of everything relevant (all addresses are cache VAs):
+
+| image | subcache | file offset | `__TEXT` |
+|---|---|---:|---|
+| `/System/Library/Frameworks/QuartzCore.framework/QuartzCore` | `.03` | `0x014f8000` | `0x188284000`, 0x34d000 |
+| `/System/Library/Frameworks/Metal.framework/Metal` | `.01` | `0x019b8000` | `0x181a14000`, 0x1c0000 |
+| `/System/Library/Extensions/AGXMetalA11.bundle/AGXMetalA11` | **`.38`** | `0x022e2000` | `0x209dee000`, 0x1bf000 |
+| `/System/Library/Frameworks/IOSurface.framework/IOSurface` | `.11` | `0x0139b000` | `0x1a397f000`, 0x17000 |
+| `/System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/-` | `.13` | `0x05da6000` | `0x1af222000`, 0xd000 |
+| `/System/Library/PrivateFrameworks/IOAccelerator.framework/IOAccelerator` | `.15` | `0x03474000` | `0x1b3013000`, 0x6000 |
+
+Note what that table says about `MetalPluginName = AGXMetalA11` from -2.2.1: the
+plugin is a **bundle under `/System/Library/Extensions/`**, not a framework, and
+it is a 1.8 MB `__TEXT` of Objective-C classes named `AGXA11Family*`.
+
+Carving recipe that works: in-cache images keep their original
+`LC_SEGMENT_64.fileoff`, which is relative to the containing subcache file, so
+`__TEXT` can be carved by copying from its declared `fileoff` (that is what
+`carve_text.py` does, and it needs no other segment). The coalesced
+`__DATA*`/`__LINKEDIT` segments point into *other* subcaches and were not
+carved -- they were not needed.
+
 
 ---
 
@@ -147,8 +220,10 @@ yet established."*
 
 #### 2.1a Direct disassembly
 
-See the subsection with this heading at the end of the document (-7), which is
-filled in from the extracted cache.
+The cache side is in -7.1. The short version: `CA_ENABLE_OGL` and
+`MetalContext` are verified present as strings in QuartzCore's
+`__TEXT.__cstring`, but the instruction-level selection condition was not
+traced (see -7.1 for exactly why and what would finish it).
 
 ### 2.2 The kernel-side contract for a Metal device -- **read straight out of Apple's kernel**
 
@@ -358,7 +433,10 @@ to satisfy the fourth.
 
 #### 2.3a The userland side
 
-See -7.
+Verified in -7.3: `-[AGXA11FamilyDevice initWithAcceleratorPort:-]` takes an
+accelerator Mach port, then `AGXA11FamilyCommandQueue`/`-CommandBuffer` are
+created, and the plugin demands a **KMD features string** and driver
+information from the service. Both halves agree: no probe-only path.
 
 ### 2.4 GPU family / feature negotiation
 
@@ -718,6 +796,36 @@ Anything promising a Metal device in two weeks is promising a demo that hangs
 | `/root/dsc/out/agxg10p-text-dis.txt` | 97 891 lines, AGX `__TEXT_EXEC.__text` disassembly |
 | `/root/dsc/out/iogpufamily-text-dis.txt` | IOGPU `__TEXT_EXEC.__text` disassembly |
 | `/root/mdss-blit-skeleton.c` | the MDP5 blit skeleton (compiles; not wired into the build) |
+| `/root/dsc/sysos/087-86593-047.dmg` | Cryptex1,SystemOS DMG, 2 743 074 816 bytes, CRC-32 ok |
+| `/root/dsc/cache/dyld_shared_cache_arm64[.01-.40]` | the split cache, **41 files / 2 384 232 448 bytes**, each size verified against its own header |
+| `/root/dsc/img/{QuartzCore,Metal,AGXMetalA11,IOSurface,IOAccelerator,IOMobileFramebuffer}.text` | carved `__TEXT` of the target images |
+| `/root/dsc/out/*` | as above |
+
+Tools written for this (all on `E:\ios-sweat\` and copied to `/root/dsc/`):
+
+| tool | purpose |
+|---|---|
+| `carve_kext.py` | carve a prelinked kext Mach-O out of the kernelcache (relocates `__TEXT`) |
+| `carve_dsc.py` | carve the 41 split-cache files out of the raw APFS image |
+| `dsc_refs.py` | decode the subcache array (uuid / size / suffix, 56-byte stride) |
+| `dsc_check.py` | verify every carved cache file against its own header |
+| `dsc_imgs.py` | find in-cache Mach-Os by `LC_ID_DYLIB` install name (3 026 images) |
+| `carve_text.py` | carve just `__TEXT` of a chosen in-cache image |
+| `greps.py`, `xref_str.py`, `metal_xref.sh` | string and cross-reference searches |
+| `find_dispatch.py`, `scan_ptrs.py` | attempted `IOExternalMethodDispatch` recovery (**failed** -- see note) |
+| `dlseg.py` | verified segmented range downloader for the IPSW members |
+| `raw2elf.py` | wrap a raw AArch64 blob in ELF (superseded by `carve_kext.py`) |
+
+**Honest note on the user-client dispatch tables.** I tried to recover
+`IOGPUDeviceUserClient`'s `IOExternalMethodDispatch` array (selector - function
+- in/out sizes) from `IOGPUFamily`'s `__DATA_CONST.__const` with
+`find_dispatch.py` and `scan_ptrs.py`. Both found **zero** entries: in a
+prelinked kernelcache, pointers inside `__DATA_CONST` are not plain virtual
+addresses (they are prelink-relative / chained-fixup encoded), so a naive
+8-byte-pointer scan cannot see them. The selector-handler mapping is therefore
+**not** in this report; only the handler *names* (-2.2.2) are, and those come
+from the C++ type encodings in `__cstring`, which are unambiguous. Recovering
+the numbers needs the fixup chain walked (or a boot with IOKit tracing, -4).
 
 Reproduce:
 
@@ -745,12 +853,112 @@ offset `0x97c000` for VA `0xfffffff004dc8000`. `carve_kext.py` then copies each
 "not reached", the 4.73 GB filesystem DMG did not finish downloading inside the
 session, and everything the kernelcache can prove is already in -2.2--2.4.*
 
-### 7.1 Renderer selection (Phase 2.1)
+### 7.1 Renderer selection (Phase 2.1) -- **partly answered; the conditional itself is not traced**
 
-### 7.2 Metal device discovery (Phase 2.2, userland half)
+What is now verified from the extracted cache:
 
-### 7.3 Post-device call path (Phase 2.3, userland half)
+* `CA_ENABLE_OGL` is a real C string in QuartzCore `__TEXT.__cstring` at VA
+  `0x18857f493` (found by scanning the carved `__TEXT`; `QuadCore.__TEXT` starts
+  at `0x188284000`, `__cstring` at `0x188579bf0` + 0x28eed bytes long).
+* `MetalContext` appears as a string in the same section, alongside the
+  `CA::OGL::` primitive/blend enum names and the `CGMetalContext` note
+  `com.apple.coreanimation.CGMetalContext`.
+* `com.apple.coreanimation.CARenderOGL` exists as a signpost subsystem name.
 
-### 7.4 GPU family negotiation (Phase 2.4)
+What is **not** answered, and I will not dress it up: the *instruction-level*
+condition that picks `metal_new_context` over `gles_new_context` over
+`sw_new_context` was **not** traced. My cross-reference attempt
+(`xref_str.py QuartzCore CA_ENABLE_OGL`) found **0** `adrp` references to the
+page holding the string (`0x18857f000`), and `llvm-objdump` produced **0 lines**
+of disassembly for the carved `QuartzCore.text` because the carve keeps only
+`__TEXT` and drops the `__DATA*`/`__LINKEDIT` segments the tool wants. So:
+
+* the string and the class names: **verified**;
+* "the exact condition that selects Metal": **not established** -- **unverified**.
+
+The plausible shape of it (a `MTLCreateSystemDefaultDevice()` that returns NULL
+plus a `CA_ENABLE_OGL` override) remains a hypothesis, and this report does not
+claim otherwise. To finish it: re-carve QuartzCore **whole** (all five segments,
+pulling the coalesced `__DATA*` from the subcaches the segment table names), then
+`llvm-objdump -d` and follow the `adrp`/`add` pairs; or run `ipsw dyld disass`
+on a cache tree `ipsw` accepts.
+
+That said, -2.2 and -7.2 answer the question that actually matters -- *what does
+Metal need* -- from two independent directions, so the missing conditional does
+not change any conclusion in -3--5: today `CA::OGL::SW` is chosen because
+`MTLCreateSystemDefaultDevice()` returns NULL, and it returns NULL because no
+`IOAcceleratorES` service exists to match.
+
+### 7.2 Metal device discovery (Phase 2.2, userland half) -- **verified, and it confirms the kernel side exactly**
+
+`Metal.framework`'s `__TEXT.__cstring` contains a single contiguous run of
+strings at VA `0x181b77307`-`0x181b773c1` that *is* the device-discovery code's
+string table. Verbatim, in order:
+
+```
+MetalPluginName
+MetalPluginClassName
+IOAcceleratorES
+%s: IOServiceGetMatchingServices failed %x
+```
+
+That is the whole algorithm, and it matches -2.2.1's personality exactly:
+
+1. `IOServiceGetMatchingServices` on **`IOAcceleratorES`** -- the
+   `IOMatchCategory` the AGX personality publishes. (Not `IOAccelerator`, not
+   `IOGPU`.)
+2. read the service property **`MetalPluginName`** - `AGXMetalA11`.
+3. read **`MetalPluginClassName`** - the class to instantiate inside that
+   bundle.
+4. if the match fails, log `%s: IOServiceGetMatchingServices failed %x` and
+   return NULL -- which is exactly today's situation, and the reason
+   `CA::OGL::SW` is used.
+
+`Metal.framework` also carries `AGX_LOG_SHADER_COMPILER_REQUEST` and an ObjC
+class `IOAcceleratorFamilySupport`, and the method name `isAGX` -- i.e. the
+framework itself distinguishes AGX from other accelerator families.
+
+**No `gpu-core-count`, no `IOGLBundleName` anywhere in `Metal.framework`'s
+strings** -- consistent with the kernelcache result in -2.2.1.
+
+### 7.3 Post-device call path (Phase 2.3, userland half) -- **verified enough to settle the question**
+
+From `AGXMetalA11` (the plugin Metal would load):
+
+| evidence | meaning |
+|---|---|
+| `-[AGXA11FamilyDevice initWithAcceleratorPort:simultaneousInstances:]`, `initWithAcceleratorPort:options:`, `initWithAcceleratorPort:` | the device object is built **from an accelerator Mach port**, i.e. from `IOServiceOpen()` on the `IOAcceleratorES` service |
+| `AGXA11FamilyCommandQueue`, `AGXA11FamilyCommandBuffer` | the first objects created after the device |
+| `AGXA11FamilyRenderContext`, `-ComputeContext`, `-BlitContext`, `-ResourceStateContext`, `-DebugContext` | encoders |
+| `-[AGXA11FamilyCommandBuffer renderCommandEncoderWithDescriptor:]`, `-blitCommandEncoderCommon:`, `-parallelRenderCommandEncoderWithDescriptor:` | what `backboardd` will call for CoreAnimation |
+| `AGX: %s:%d:%s: *** The KMD features string is empty - This probably indicates a build, setup, or consistency issue` | the plugin **queries a features string from the kernel-mode driver** |
+| `AGX: %s:%d:%s: *** Could not query driver information from the KMD - -` | and a driver-information query |
+| `AGX: NOTE: UMD was built in RELEASE mode, but KMD was not; is this what you intended?` | it even compares UMD/KMD build modes |
+
+So the userland half confirms -2.3 from the other side: a device object leads
+**immediately** to a command queue and command buffers, and the plugin demands a
+**KMD features string** and driver information from the service before it will
+work. There is no probe-only path in either half.
+
+### 7.4 GPU family negotiation (Phase 2.4) -- **partly answered**
+
+* `supportsFamily:` is a real selector: it appears in `AGXMetalA11`'s
+  `__objc_methname` (alongside `acceleratorPort`, `initWithAcceleratorPort:`).
+* The concrete implementation classes are named for the family:
+  **`AGXA11FamilyDevice`**, `AGXA11FamilyCommandQueue`, `-CommandBuffer`,
+  `-RenderContext`, - -- i.e. the *family* is baked into the class name by the
+  plugin, not negotiated at runtime from a feature mask. There is no
+  `AGXCommonFamilyDevice` fallback visible in the class list, so
+  "an unknown/lower family still yields a working device" has **no supporting
+  evidence**.
+* The kernel side (-2.4) maps `gpu,t8015` - `AGXG10P` - `AGXMetalA11` through a
+  static personality table with no downgrade knob.
+
+Which feature booleans `supportsFamily:` actually returns, and whether any of
+them can be turned off to get a slower-but-working device, was **not**
+determined -- that needs the method body, which is behind the same disassembly
+gap as -7.1. Marked **unverified**. Given -4 (the blocker is the AGX command
+stream and firmware, not a feature bit), the answer would not change the verdict.
 
 ---
+

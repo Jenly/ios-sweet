@@ -2,6 +2,70 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #3: KERNEL BUILT SUCCESSFULLY (CI run 39289982773) <<<
+
+**`kernel.development.sweet` exists: 17,222,840 bytes, `Mach-O 64-bit arm64
+executable, flags:<NOUNDEFS|PIE>`, 70,863 defined symbols, 0 undefined.**
+
+Run: https://github.com/sbccc1888/ios-sweet/actions/runs/39289982773
+Branch `chiron-support` at `2fec6d1`, 8 min on macos-14. SHA256
+`ef1c10d167dec0b8a9addd8e3edb6768eb31383115747f48a9548e5f3abd0530`, matching the
+artifact's own `SHA256SUMS`.
+
+**Run 1 (39287758533) failed and the reason is worth remembering.** Seven
+identical errors, all one cause:
+
+```
+bsd/dev/sweet_keys.c:15:10: fatal error: 'pexpert/SweetBoard.h' file not found
+```
+
+In XNU a header that merely exists in the source tree is **not** visible to
+`#include <dir/X.h>`. The build copies only the headers named in the owning
+directory's Makefile lists into `build/xnu.obj/EXPORT_HDRS/<comp>/<comp>/`, and
+that is the `-I` path every TU uses. Patch 0082 created
+`pexpert/pexpert/SweetBoard.h` but never added it to `EXPORT_MI_LIST`. Fix: one
+hunk in `pexpert/pexpert/Makefile`.
+
+My local compile check could not have caught this, and that is the useful part:
+`tools/xnu-localcc.py` compiles with `-I<tree>/pexpert`, going straight to the
+source tree and **bypassing the export step**. It resolved the header happily.
+
+New guard: **`tools/xnu-hdrcheck.py`** models the real mechanism. For every
+`#include <comp/rest>` in the touched files it resolves the source header and
+requires its basename to be listed in the governing Makefile's export/install
+lists, with `${VAR}` expansion (without that, `pexpert.h` itself looked
+unexported -- 17 false positives). Proven both ways: against the old tree it
+reports exactly the 7 problems CI hit; against the fixed tree, 0.
+
+**Not every `error:` in a CI log is yours.** Run 1 also logged
+TrustCache / iobuffermemd_monterey / skywalk_sonoma / syntax_checker_sonoma
+"errors" -- those are blacktop/darwin-xnu-build patches it deliberately skips as
+already upstream or not applicable, and they appear in every green run too.
+
+**Verification that the kernel really contains the new code** (not just that a
+file appeared):
+
+| symbol | address |
+|---|---|
+| `_chiron_touch_init` | `fffffe00074eb638` |
+| `_sweet_secondary_entry` | `fffffe000748d000` |
+| `_sweet_cpu_signal_is_enabled` | `fffffe000747f0e8` |
+
+and the driver's log strings are present, e.g.
+`CHIRON TOUCH: panel %ux%u`, `CHIRON TOUCH: QUP silent, trying the GCC clocks`,
+`CHIRON TOUCH: not an MSM8998 board, driver off (chirontouch=1 forces it)`,
+plus every `SWEET TOUCH:` string, which confirms the sweet/touch/keys paths
+compiled in too.
+
+The SweetBoard.h helpers (`sweet_dt_u32`, `sweet_board_is_chiron`,
+`sweet_display_geometry_for`, `sweet_panel_size`) have **no** symbols because
+they are `static inline` -- they are inlined into callers. Absence is correct
+here; do not "fix" it.
+
+**State: the kernel compiles and links for real.** Still never booted on chiron
+hardware. Next real step is the UEFI wrapper / shim-as-EFI-app so it can be
+tried, then the touch driver's first light.
+
 ### >>> UPDATE 2026-10-20 #2: link-level verification on Linux (ld64.lld) <<<
 
 **Question asked: "did the build start?" No -- and this update is about how far

@@ -1,527 +1,452 @@
 /*
- * mdss-blit-skeleton.c -- SKELETON ONLY. NOT TESTED, NOT WIRED IN, NOT BUILT.
+ * mdss-blit-skeleton.c -- MDP5 hardware blit for the ios-sweet XNU port.
  *
- * A register-level plan for a memory-to-memory 2D blit on the MSM8998
- * (Snapdragon 835) MDSS/MDP, written in the idiom of the ios-sweet XNU tree
- * (iokit/Kernel/arm/SweetFramebuffer.cpp).  It exists to make the hardware
- * sequence concrete and reviewable, NOT because it is known to work.
+ * STATUS: skeleton only.  It is NOT part of the XNU build, is not referenced
+ * from any header, and no Makefile lists it.  It exists so that the layout of
+ * the work is fixed and reviewable: everything below is traced to a register
+ * definition or a driver line that was actually read (citations inline).
  *
- * Every register offset below is traced to a file that was actually read on
- * the build server; the citation is in the comment.  Anything that could not
- * be traced is marked  TODO(unverified)  and MUST be resolved by capturing a
- * register dump from a working Android boot of the same SoC before this code
- * is trusted (see the "verification recipe" in gpu-research.md, section 8).
+ * ---------------------------------------------------------------------------
+ * WHAT IT REPLACES
+ * ---------------------------------------------------------------------------
+ * iokit/Kernel/arm/SweetFramebuffer.cpp, AppleCLCD::present() (xnufinal tree),
+ * lines 393-399 of the current file:
  *
- * It would be compiled by adding it to iokit/conf/... and calling
- * sweet_mdss_blit() from AppleCLCD::present() instead of the memcpy loop at
- * SweetFramebuffer.cpp:393-399.  It is deliberately NOT wired in: nothing in
- * the tree references these symbols today.
+ *     if (src != 0 && bpe == 4) {
+ *         for (int32_t y = 0; y < h; y++) {
+ *             memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ *                    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow
+ *                                   + (uint64_t)sx * 4),
+ *                    (size_t)w * 4);
+ *         }
+ *     }
  *
- * HARD PRECONDITIONS (all of them are *unproven* on this port):
- *   1. MMSS GDSC ("gdsc_mdss") can be turned on from XNU by poking the
- *      register, i.e. it is not owned by a secure/always-on power domain.
- *   2. The five MDSS clocks can be enabled by poking MMSS CC branch
- *      registers, i.e. the rate is already what the bootloader set (we do
- *      not program the PLL/RCG here).
- *   3. The MMSS SMMU (0x0CD00000) is left *unprogrammed/bypassed* by the
- *      UEFI boot chain, so MDSS DMA uses physical addresses.  Evidence that
- *      this is the boot-time state: the Linux driver explicitly does not
- *      attach the SMMU until the continuous-splash handoff is over because
- *      "it may still be working with phys addr" (mdss_mdp.c:1521-1526).
- *   4. Source and destination buffers are *physically contiguous*.
- *   5. The MDP is not already busy on the CTL/LM/WB pair chosen here.
- *      (CTL0+LM0+VIG0+INTF0 are assumed to be the bootloader's scanout path
- *      and are NOT touched; this file uses CTL1/LM1/DMA1/WB.)
+ * Today that row loop is the only per-frame pixel work in the kernel: one
+ * 32-bpp rectangle per enabled CA layer, copied into the panel memory the
+ * bootloader left scanning out (sweet 0x9c000000, chiron 0x9d400000,
+ * tools/devices.py "fb").  The loop is called from present(), which
+ * AppleCLCD runs from a timer at sweetfb_hz (default 10-30 Hz), not per swap;
+ * see the comment at SweetFramebuffer.cpp:292-298.
  *
- * Copyright: same terms as the rest of the ios-sweet tree (GPL-2.0-ish
- * kernel glue; the register facts are from Qualcomm's GPL msm-4.4 tree).
+ * With this file wired in, the same rectangle is copied by the MDP5
+ * write-back path: source surface -> VIG/DMA SSPP -> layer mixer -> WB ->
+ * panel memory.  The CPU then only writes ~20 registers per layer per frame.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE ADDRESSES ARE 32-BIT (and why that is fine here)
+ * ---------------------------------------------------------------------------
+ * The MDP5 SSPP source-address registers are single 32-bit registers:
+ *   mdp5.xml.h REG_MDP5_PIPE_SRC0_ADDR = 0x14 + pipe base            (no _HI)
+ *   sde_hw_sspp.c:748-750  writes cfg->layout.plane_addr[i] with
+ *   sde_reg_write() -> writel_relaxed()  (sde_hw_util.c, sde_reg_write body)
+ * so src and dst must both live below 4 GiB (physical, or an SMMU IOVA).
+ * That holds for us by construction: both boards' kernel RAM windows are
+ * entirely below 4 GiB (tools/devices.py: sweet ram_low 0xb0000000+0x4d000000,
+ * chiron ram_low 0xa0000000+0x60000000, and every IOKit buffer comes from
+ * those windows), and the panel memory itself is at 0x9c000000 / 0x9d400000.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IS *NOT* SOLVED HERE (see gpu-research.md, "What still cannot be faked")
+ * ---------------------------------------------------------------------------
+ *  1. Clocks/power.  msm8998-mdss.dtsi:107-114 lists 7 clocks on the MDSS node
+ *     (mnoc_clk, iface_clk, bus_clk, core_clk_src, core_clk, vsync_clk,
+ *     lut_clk) plus vdd-supply = gdsc_mdss and gdsc-core-supply =
+ *     gdsc_bimc_smmu.  This skeleton ASSUMES the bootloader left the display
+ *     pipeline running (which it must have, otherwise nothing is on screen
+ *     today).  It does NOT touch the clock controller.  UNVERIFIED.
+ *  2. SMMU.  msm8998 routes MDP through mmss_smmu (msm8998-mdss.dtsi:233-259,
+ *     smmu_mdp_unsec / smmu_mdp_sec context banks).  Two options:
+ *       (a) leave the SMMU bypassed for the MDP context bank and program
+ *           physical addresses (simplest, what this skeleton assumes), or
+ *       (b) build a page table.  UNVERIFIED which state the bootloader leaves.
+ *  3. Arbitration/QoS.  msm8998-mdss.dtsi:40-56 has VBIF QoS remapper values
+ *     (qcom,mdss-vbif-qos-rt-setting = <1 2 2 2>, vbif-settings 0xac/0xd0).
+ *     Not programmed here; the RT reads may be starved by the CPU otherwise.
+ *  4. Tearing.  The blit writes panel memory while the display controller is
+ *     scanning it out.  Need either a vsync-aligned start or a double buffer.
+ *     The existing code has the same problem (it memcpy's live), so this is
+ *     not a regression, but it is the obvious next fix.
  */
 
-#include <IOKit/IOLib.h>
-#include <IOKit/IOMemoryDescriptor.h>
-#include <IOKit/IOMemoryMap.h>
-#include <mach/mach_time.h>
+#ifndef __IOS_SWEET_MDSS_BLIT_SKELETON__
+#define __IOS_SWEET_MDSS_BLIT_SKELETON__
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ------------------------------------------------------------------ */
+/* 1. Register map                                                     */
+/* ------------------------------------------------------------------ */
 
 /*
- * ---------------------------------------------------------------------------
- * 1. Addresses
+ * Base addresses, all from the live MSM8998 device tree fragment that this
+ * repository already carries: arch/arm64/boot/dts/qcom/msm8998-mdss.dtsi
+ * (LineageOS/android_kernel_xiaomi_msm8998).
  *
- * MDSS top-level register block: 0x0C900000, length 0x90000
- *   ... "reg = <0x0c900000 0x90000>" -- msm8998-mdss.dtsi:17
- * MDP register window = MDSS base + qcom,mdss-mdp-reg-offset (0x1000)
- *   ... msm8998-mdss.dtsi:58
- * VBIF: 0x0C9B0000, length 0x1040 -- msm8998-mdss.dtsi:17-19
- * Per-block offsets inside the MDP window (msm8998-mdss.dtsi):
- *   CTL0..4        0x2000 0x2200 0x2400 0x2600 0x2800   (:91)
- *   VIG0..3        0x5000 0x7000 0x9000 0x0B000         (:67)
- *   DMA0..3        0x25000 0x27000 0x29000 0x2B000      (:69)
- *   LM0..3         0x45000 0x46000 0x47000 0x4A000      (:93)
- *   DSPP0..1       0x55000 0x57000                      (:95)
- *   WB             0x66000   (named "WB_2" in :180)     (:96)
- *   INTF0..3       0x6B000 0x6B800 0x6C000 0x6C800      (:97)
- *   PingPong0..3   0x71000 0x71800 0x72000 0x72800      (:99)
- * MMSS clock controller: 0x0C8C0000, length 0x40000 -- msm8998.dtsi:948-950
- * MMSS SMMU:            0x0CD00000, length 0x40000 -- msm-arm-smmu-8998.dtsi:98-101
- * MDSS GDSC:            0x0C8C2304 (MMSS CC + 0x2304) -- msm-gdsc-8998.dtsi:116
+ *   :14   mdss_mdp: qcom,mdss_mdp@c900000
+ *   :17   reg = <0x0c900000 0x90000>, <0x0c9b0000 0x1040>
+ *         reg-names = "mdp_phys", "vbif_phys"
+ *   :20   interrupts = <0 83 0>        (GIC SPI 83 -> INTID 32+83 = 115)
+ *   :58   qcom,mdss-mdp-reg-offset = <0x00001000>
+ *
+ * Every block offset below is "relative to mdp_phys" per the comment at
+ * msm8998-mdss.dtsi:77-79, i.e. the absolute address of an MDP5 register is
+ *
+ *     MDP_BASE + <block offset from DTS> + <register offset from mdp5.xml.h>
+ *
+ * and mdp5.xml.h's __offset_PIPE()/__offset_LM()/__offset_CTL() helpers return
+ * exactly the DTS block offsets (mdp5.xml.h:541-556, 1066-1078, 355-366).
  */
-#define SWEET_MDSS_BASE            0x0C900000UL
-#define SWEET_MDSS_LEN             0x90000UL
-#define SWEET_MDP_OFF              0x1000UL        /* msm8998-mdss.dtsi:58 */
-#define SWEET_MMSS_CC_BASE         0x0C8C0000UL
-#define SWEET_MMSS_CC_LEN          0x40000UL
+#define MSM8998_MDP_BASE        0x0C900000u   /* msm8998-mdss.dtsi:17 */
+#define MSM8998_VBIF_BASE       0x0C9B0000u   /* msm8998-mdss.dtsi:17 */
+#define MSM8998_MDP_TOP         0x00001000u   /* msm8998-mdss.dtsi:58 */
 
-/* Absolute addresses used by this file (MDP window + block offset). */
-#define SWEET_MDP_BASE             (SWEET_MDSS_BASE + SWEET_MDP_OFF)
-#define SWEET_CTL1                 (SWEET_MDP_BASE + 0x2200UL)  /* dtsi:91 */
-#define SWEET_DMA1                 (SWEET_MDP_BASE + 0x27000UL) /* dtsi:69 */
-#define SWEET_LM1                  (SWEET_MDP_BASE + 0x46000UL) /* dtsi:93 */
-#define SWEET_WB                   (SWEET_MDP_BASE + 0x66000UL) /* dtsi:96 */
+/* SSPP (source pipe) block bases -- msm8998-mdss.dtsi:67-71 */
+#define MSM8998_VIG0_SSPP       0x00005000u   /* :67 qcom,mdss-pipe-vig-off */
+#define MSM8998_VIG1_SSPP       0x00007000u
+#define MSM8998_VIG2_SSPP       0x00009000u
+#define MSM8998_VIG3_SSPP       0x0000B000u
+#define MSM8998_DMA0_SSPP       0x00025000u   /* :69 qcom,mdss-pipe-dma-off */
+#define MSM8998_DMA1_SSPP       0x00027000u
+#define MSM8998_DMA2_SSPP       0x00029000u
+#define MSM8998_DMA3_SSPP       0x0002B000u
+
+/* CTL (control / flush / kick) -- msm8998-mdss.dtsi:91 */
+#define MSM8998_CTL0            0x00002000u
+#define MSM8998_CTL1            0x00002200u
+
+/* Layer mixer 0 ... 3 -- msm8998-mdss.dtsi:93 (note: on 8998 the mixer and
+ * the interface are one block, hence the DTS name "mixer-intf") */
+#define MSM8998_LM0             0x00045000u
+#define MSM8998_LM1             0x00046000u
+
+/* Writeback -- msm8998-mdss.dtsi:96 qcom,mdss-wb-off */
+#define MSM8998_WB              0x00066000u
+
+/* SSPP register offsets, from mdp5.xml.h (all "+ pipe base") */
+#define MDP5_PIPE_SRC_SIZE          0x0000u  /* mdp5.xml.h:696  w[15:0] h[31:16] */
+#define MDP5_PIPE_SRC_IMG_SIZE      0x0004u  /* mdp5.xml.h:710 */
+#define MDP5_PIPE_SRC_XY            0x0008u  /* mdp5.xml.h:724  x[15:0] y[31:16] */
+#define MDP5_PIPE_OUT_SIZE          0x000Cu  /* mdp5.xml.h:738 */
+#define MDP5_PIPE_OUT_XY            0x0010u  /* mdp5.xml.h:752 */
+#define MDP5_PIPE_SRC0_ADDR         0x0014u  /* mdp5.xml.h:766  (32-bit!) */
+#define MDP5_PIPE_SRC1_ADDR         0x0018u  /* mdp5.xml.h:768 */
+#define MDP5_PIPE_SRC_STRIDE_A      0x0024u  /* mdp5.xml.h:774  P0|P1<<16 */
+#define MDP5_PIPE_SRC_STRIDE_B      0x0028u  /* mdp5.xml.h:788  P2|P3<<16 */
+#define MDP5_PIPE_SRC_FORMAT        0x0030u  /* mdp5.xml.h:804 */
+#define MDP5_PIPE_SRC_UNPACK        0x0034u  /* mdp5.xml.h:858 */
+#define MDP5_PIPE_SRC_OP_MODE       0x0038u  /* mdp5.xml.h:884 */
+#define MDP5_PIPE_SRC_CONSTANT_COLOR 0x003Cu /* mdp5.xml.h:901 */
+#define MDP5_PIPE_FETCH_CONFIG      0x0048u  /* mdp5.xml.h:903 */
+
+/* LM register offsets, from mdp5.xml.h (all "+ LM base") */
+#define MDP5_LM_OP_MODE             0x0000u  /* sde_hw_lm.c:19 LM_OP_MODE */
+#define MDP5_LM_OUT_SIZE            0x0004u  /* mdp5.xml.h:1086; sde_hw_lm.c:20 */
+#define MDP5_LM_BORDER_COLOR_0      0x0008u  /* mdp5.xml.h:1100 */
+#define MDP5_LM_BLEND0_OP           0x0020u  /* __offset_BLEND(0)=0x20, mdp5.xml.h:1104-1110 */
+#define MDP5_LM_BLEND0_FG_ALPHA     0x0024u  /* sde_hw_lm.c:27 */
+#define MDP5_LM_BLEND0_BG_ALPHA     0x0028u  /* sde_hw_lm.c:28 */
+
+/* CTL register offsets, from mdp5.xml.h (all "+ CTL base") */
+#define MDP5_CTL_LAYER0             0x0000u  /* mdp5.xml.h:380 */
+#define MDP5_CTL_OP                 0x0014u  /* mdp5.xml.h:446; sde_hw_ctl.c:27 */
+#define MDP5_CTL_FLUSH              0x0018u  /* mdp5.xml.h:468; sde_hw_ctl.c:28 */
+#define MDP5_CTL_START              0x001Cu  /* mdp5.xml.h:499; sde_hw_ctl.c:29 */
+
+/* WB register offsets, from sde_hw_wb.c:20-48.  SDE 3.0.0 is MSM8998 -- see
+ * sde_hw_catalog.h:45-46, which annotates SDE_HW_VER_300 (3,0,0) as
+ * "8998 v1.0" and SDE_HW_VER_301 (3,0,1) as "8998 v1.1". */
+#define WB_DST_FORMAT               0x0000u  /* sde_hw_wb.c:20 */
+#define WB_DST_OP_MODE              0x0004u  /* sde_hw_wb.c:21 */
+#define WB_DST_PACK_PATTERN         0x0008u  /* sde_hw_wb.c:22 */
+#define WB_DST0_ADDR                0x000Cu  /* sde_hw_wb.c:23 */
+#define WB_DST_YSTRIDE0             0x001Cu  /* sde_hw_wb.c:27 */
+#define WB_DST_WRITE_CONFIG         0x0048u  /* sde_hw_wb.c:35 */
+#define WB_OUT_SIZE                 0x0074u  /* sde_hw_wb.c:42 */
+#define WB_ALPHA_X_VALUE            0x0078u  /* sde_hw_wb.c:43 */
+#define WB_DST_ADDR_SW_STATUS       0x02B0u  /* sde_hw_wb.c:45 */
+#define WB_OUT_IMAGE_SIZE           0x02C0u  /* sde_hw_wb.c:47 */
+#define WB_OUT_XY                   0x02C4u  /* sde_hw_wb.c:48 */
+
+/* CTL_FLUSH bit assignments.  Two independent sources agree:
+ *   - mdp5.xml.h:469-497   MDP5_CTL_FLUSH_VIG0=0x1 ... DMA0=0x800 ...
+ *                          LM0=0x40 ... WB=0x10000 ... CTL=0x20000
+ *   - sde_hw_ctl.c get_bitmask_sspp()/get_bitmask_mixer()/get_bitmask_wb(),
+ *     which return BIT(0)/BIT(1)/BIT(2)/BIT(18) for VIG0..3, BIT(11)/BIT(12)
+ *     for DMA0/1, BIT(6)..BIT(10) for LM0..4, and append BIT(17) for CTL.
+ */
+#define MDP5_FLUSH_VIG0         0x00000001u  /* mdp5.xml.h:469 */
+#define MDP5_FLUSH_DMA0         0x00000800u  /* mdp5.xml.h:480 */
+#define MDP5_FLUSH_LM0          0x00000040u  /* mdp5.xml.h:475 */
+#define MDP5_FLUSH_WB           0x00010000u  /* mdp5.xml.h:485 */
+#define MDP5_FLUSH_CTL          0x00020000u  /* mdp5.xml.h:486 */
+
+/* MDP5_CTL_OP fields (mdp5.xml.h:447-459) */
+#define MDP5_CTL_OP_MODE(v)         (((v) << 0)  & 0x0000000Fu)
+#define MDP5_CTL_OP_INTF_NUM(v)     (((v) << 4)  & 0x00000070u)
+#define MDP5_CTL_OP_CMD_MODE        0x00020000u
+
+/* ------------------------------------------------------------------ */
+/* 2. Formats                                                          */
+/* ------------------------------------------------------------------ */
+/*
+ * SRC_FORMAT layout (mdp5.xml.h:804-857, and the encoder at
+ * sde_hw_sspp.c:281-317):
+ *   [1:0]   R_BPC-1        (COLOR_8BIT == 3 per bit, see sde_formats.c)
+ *   [3:2]   G_BPC-1
+ *   [5:4]   B_BPC-1
+ *   [7:6]   A_BPC-1
+ *   [8]     ALPHA_ENABLE   (sde_hw_sspp.c:289 writes BIT(8) as SRCC3_EN)
+ *   [10:9]  CPP-1          (components per pixel - 1)
+ *   [13:12] UNPACK_COUNT-1
+ *   [17]    UNPACK_TIGHT
+ *   [18]    UNPACK_ALIGN_MSB
+ *   [20:19] FETCH_TYPE
+ *   [22:23] CHROMA_SAMP
+ * SRC_UNPACK holds the four element indices, one byte each (mdp5.xml.h:858+).
+ * The element order is what makes ABGR vs RGBA: sde_formats.c:204-260 lists
+ * ARGB8888 as elements { C1_B_Cb, C0_G_Y, C2_R_Cr, C3_ALPHA } and ABGR8888 as
+ * { C2_R_Cr, C0_G_Y, C1_B_Cb, C3_ALPHA }.
+ */
+#define SWEET_FMT_BPC8          3u           /* 8 bits per component          */
+#define SWEET_FMT_CPP4          3u           /* 4 components per pixel        */
+#define SWEET_FMT_UNPACK_4      3u           /* 4 components, unpack_count-1  */
+
+/* Element indices used by SRC_UNPACK (sde_formats.c:44-70 macro args) */
+#define SWEET_ELEM_C0_G_Y       0u
+#define SWEET_ELEM_C1_B_Cb      1u
+#define SWEET_ELEM_C2_R_Cr      2u
+#define SWEET_ELEM_C3_ALPHA     3u
+
+/* One 32-bpp little-endian pixel: IOSurface 'BGRA' (0x42475241) and
+ * 'ARGB'/'RGBA' are all handled by picking the element order; this is the
+ * order for BGRA8888 (memory bytes B,G,R,A), i.e. sde_formats.c BGRA8888. */
+#define SWEET_SRC_FORMAT_BGRA8888 \
+	((SWEET_FMT_BPC8 << 0) | (SWEET_FMT_BPC8 << 2) | (SWEET_FMT_BPC8 << 4) | \
+	 (SWEET_FMT_BPC8 << 6) | (1u << 8) | (SWEET_FMT_CPP4 << 9) |          \
+	 (SWEET_FMT_UNPACK_4 << 12) | (1u << 17))
+#define SWEET_SRC_UNPACK_BGRA8888 \
+	((SWEET_ELEM_C3_ALPHA << 0) | (SWEET_ELEM_C2_R_Cr << 8) | \
+	 (SWEET_ELEM_C0_G_Y << 16) | (SWEET_ELEM_C1_B_Cb << 24))
+
+/* WB_DST_FORMAT for a linear 32-bpp RGB destination; field layout is
+ * sde_hw_wb.c:96-133:
+ *   [1:0][3:2][5:4][7:6] component bit depths-1 for C0..C3
+ *   [8]   DSTC3_EN (alpha present)
+ *   [10:9] DST_BPP-1
+ *   [13:12] PACK_COUNT-1
+ *   [17]  PACK_TIGHT, [18] PACK_ALIGN_MSB
+ */
+#define SWEET_WB_FORMAT_BGRA8888 \
+	((SWEET_FMT_BPC8 << 0) | (SWEET_FMT_BPC8 << 2) | (SWEET_FMT_BPC8 << 4) | \
+	 (SWEET_FMT_BPC8 << 6) | (1u << 8) | (SWEET_FMT_CPP4 << 9) |          \
+	 (SWEET_FMT_UNPACK_4 << 12) | (1u << 17))
+#define SWEET_WB_PACK_BGRA8888 \
+	((SWEET_ELEM_C3_ALPHA << 24) | (SWEET_ELEM_C2_R_Cr << 16) | \
+	 (SWEET_ELEM_C0_G_Y << 8) | (SWEET_ELEM_C1_B_Cb << 0))
+
+/* ------------------------------------------------------------------ */
+/* 3. The blit                                                         */
+/* ------------------------------------------------------------------ */
+
+struct sweet_blit {
+	uint32_t src_phys;      /* < 4 GiB, see header comment            */
+	uint32_t src_stride;    /* bytes per row                          */
+	uint32_t src_w, src_h;  /* full source image size                 */
+	uint32_t src_x, src_y;  /* source rect origin                     */
+	uint32_t dst_phys;      /* < 4 GiB (panel memory or a scratch)    */
+	uint32_t dst_stride;    /* bytes per row of the destination       */
+	uint32_t dst_x, dst_y;  /* destination position                   */
+	uint32_t w, h;          /* rectangle size, both must be > 0       */
+};
 
 /*
- * ---------------------------------------------------------------------------
- * 2. Clock / power registers
- *
- * CBCR offsets inside the MMSS CC block, from
- * include/dt-bindings/clock/msm-clocks-hwio-8998.h:
- *   MMSS_MDSS_AHB_CBCR      0x02308   (:354)
- *   MMSS_MDSS_AXI_CBCR      0x02310   (:355)
- *   MMSS_MDSS_MDP_CBCR      0x0231C   (:373)
- *   MMSS_MDSS_MDP_LUT_CBCR  0x02320   (:374)
- *   MMSS_MDSS_VSYNC_CBCR    0x02328   (:378)
- *   MMSS_MDP_CMD_RCGR       0x02040   (:259)   <- source RCG, NOT touched
- * Branch enable is bit 0 of the CBCR: clock-local2.c:68
- *   "#define CBCR_BRANCH_ENABLE_BIT BIT(0)"
- * GDSC power-on is bit 31 of the GDSCR: gdsc.c:29 "#define PWR_ON_MASK BIT(31)"
- * The GDSC status bits are polled by poll_gdsc_status() (gdsc.c:87-118); the
- * exact status bit position is  TODO(unverified)  here on purpose -- read it
- * out of drivers/clk/msm/gdsc.c before enabling, do not guess.
+ * Register accessors.  In the real XNU driver these become
+ *   OSWriteLittleInt32(fMDPBase, off, val) / OSReadLittleInt32(fMDPBase, off)
+ * on a memory-mapped IOKit range obtained from the /arm-io/mdss node.  They
+ * are function pointers here so the skeleton links in a host test harness.
  */
-#define SWEET_CBCR_MDSS_AHB        (SWEET_MMSS_CC_BASE + 0x02308UL)
-#define SWEET_CBCR_MDSS_AXI        (SWEET_MMSS_CC_BASE + 0x02310UL)
-#define SWEET_CBCR_MDP             (SWEET_MMSS_CC_BASE + 0x0231CUL)
-#define SWEET_CBCR_MDP_LUT         (SWEET_MMSS_CC_BASE + 0x02320UL)
-#define SWEET_CBCR_VSYNC           (SWEET_MMSS_CC_BASE + 0x02328UL)
-#define SWEET_GDSCR_MDSS           0x0C8C2304UL
-#define SWEET_GDSC_PWR_ON          (1U << 31)       /* gdsc.c:29 */
+typedef void    (*sweet_mdp_write_fn)(void *ctx, uint32_t off, uint32_t val);
+typedef uint32_t (*sweet_mdp_read_fn)(void *ctx, uint32_t off);
 
-/* ---------------------------------------------------------------------------
- * 3. MDP register offsets inside the MDP window
- *
- * All from drivers/video/fbdev/msm/mdss_mdp_hwio.h (line numbers given).
- */
-/* MDSS top / MDP common */
-#define MDP_HW_VERSION             0x0000   /* relative to MDSS base (hwio.h:61) */
-#define MDP_INTR_EN                0x0010   /* hwio.h:66 */
-#define MDP_INTR_STATUS            0x0014   /* hwio.h:67 */
-#define MDP_INTR_CLEAR             0x0018   /* hwio.h:68 */
-#define MDP_RT_NRT_VBIF_CLIENT_SEL 0x0190   /* hwio.h:78 */
-#define MDP_CLK_CTRL               0x02BC   /* see mdp-settings 0x012bc, dtsi:130 */
-
-/* CTL block (base SWEET_CTL1) */
-#define CTL_LAYER(lm)              ((lm) * 0x004)   /* hwio.h:180-181 */
-#define CTL_TOP                    0x014            /* hwio.h:189 */
-#define CTL_FLUSH                  0x018            /* hwio.h:190 */
-#define CTL_START                  0x01C            /* hwio.h:191 */
-
-/* DMA/VIG SSPP source pipe (base SWEET_DMA1) */
-#define SSPP_SRC_SIZE              0x000    /* hwio.h:241 */
-#define SSPP_SRC_XY                0x008    /* hwio.h:243 */
-#define SSPP_OUT_SIZE              0x00C    /* hwio.h:244 */
-#define SSPP_OUT_XY                0x010    /* hwio.h:245 */
-#define SSPP_SRC0_ADDR             0x014    /* hwio.h:246 */
-#define SSPP_SRC_YSTRIDE0          0x024    /* hwio.h:250 */
-#define SSPP_SRC_YSTRIDE1          0x028    /* hwio.h:251 */
-#define SSPP_SRC_FORMAT            0x030    /* hwio.h:253 */
-#define SSPP_SRC_UNPACK_PATTERN    0x034    /* hwio.h:254 */
-#define SSPP_SRC_OP_MODE           0x038    /* hwio.h:255 */
-#define SSPP_FETCH_CONFIG          0x048    /* hwio.h:293 */
-
-/* Layer mixer (base SWEET_LM1) */
-#define LM_OP_MODE                 0x000    /* hwio.h:457 */
-#define LM_OUT_SIZE                0x004    /* hwio.h:458 */
-#define LM_BORDER_COLOR_0          0x008    /* hwio.h:459 */
-#define LM_BORDER_COLOR_1          0x010    /* hwio.h:460 */
-#define LM_BLEND_OFFSET(stage)     (0x20 + ((stage) * 0x30))  /* hwio.h:462 */
-#define LM_BLEND_OP                0x00     /* hwio.h:463 */
-#define LM_BLEND_FG_ALPHA          0x04     /* hwio.h:464 */
-#define LM_BLEND_BG_ALPHA          0x08     /* hwio.h:465 */
-
-/* Writeback (base SWEET_WB) */
-#define WB_DST_FORMAT              0x000    /* hwio.h:520 */
-#define WB_DST_OP_MODE             0x004    /* hwio.h:521 */
-#define WB_DST_PACK_PATTERN        0x008    /* hwio.h:522 */
-#define WB_DST0_ADDR               0x00C    /* hwio.h:523 */
-#define WB_DST_YSTRIDE0            0x01C    /* hwio.h:527 */
-#define WB_OUT_SIZE                0x074    /* hwio.h:542 */
-#define WB_ALPHA_X_VALUE           0x078    /* hwio.h:543 */
-#define WB_DST_ADDR_SW_STATUS      0x2B0    /* hwio.h:549 */
-
-/* CTL_TOP opmode values (hwio.h:195-202) */
-#define CTL_OP_WB0_MODE            0x3      /* hwio.h:200 */
-#define CTL_OP_WB1_MODE            0x4      /* hwio.h:201 */
-
-/* Interrupt bits (hwio.h:93-95) */
-#define INTR_WB_2_DONE             (1U << 4)    /* hwio.h:95 */
-#define INTR_CLEAR_ALL_WB          (0x7U)       /* WB0|WB1|WB2 done bits */
-
-/* Blend op bits (hwio.h:494-509) */
-#define BLEND_FG_ALPHA_FG_CONST    (0 << 0)     /* hwio.h:494 */
-#define BLEND_BG_ALPHA_BG_CONST    (1 << 8)     /* hwio.h:503 */
-
-/*
- * ---------------------------------------------------------------------------
- * 4. Derived constants: BGRA8888 ('BGRA' = 0x42475241, what the iOS side
- *    hands us -- SweetFramebuffer.cpp:83)
- *
- * Format entry: MDP_BGRA_8888, mdss_mdp_formats.h:320-322
- *   -> FMT_RGB_8888(..., alpha_en=1, e0=C1_B_Cb, e1=C0_G_Y, e2=C2_R_Cr,
- *      e3=C3_ALPHA)
- * FMT_RGB_8888 (mdss_mdp_formats.h:75-94) gives: fetch_planes=0 (interleaved),
- *   unpack_tight=1, unpack_align_msb=0, unpack_count=4, bpp=4,
- *   bits[C0..C3]=COLOR_8BIT=3.
- *
- * SRC_FORMAT is built by mdss_mdp_format_setup(), mdss_mdp_pipe.c:2123-2155:
- *   (chroma<<23)|(planes<<19)|(b3<<6)|(b2<<4)|(b1<<2)|(b0<<0)
- *   | ((unpack_count-1)<<12) | (unpack_tight<<17) | (unpack_align_msb<<18)
- *   | ((bpp-1)<<9)
- * =>  0xFF | 0x3000 | 0x20000 | 0x600  = 0x000236FF
- *
- * DST_FORMAT is built by mdss_mdp_writeback_format_setup(),
- * mdss_mdp_intf_writeback.c:444-479, which is the same encoding PLUS
- *   BIT(8) DSTC3_EN when bits[C3_ALPHA] or alpha_enable is set
- * => 0x000236FF | 0x100 = 0x000237FF
- *
- * PACK_PATTERN (writeback, intf_writeback.c:468-471; and the pipe's "unpack"
- * at mdss_mdp_pipe.c:2140-2141) = (e3<<24)|(e2<<16)|(e1<<8)|e0
- * => (3<<24)|(2<<16)|(0<<8)|1 = 0x03020001
- *
- * These three values are DERIVED by applying the driver's own encoding code
- * to the driver's own format table -- they were not read back from hardware.
- */
-#define SWEET_MDP_FMT_BGRA8888_SRC  0x000236FFU
-#define SWEET_MDP_FMT_BGRA8888_DST  0x000237FFU
-#define SWEET_MDP_FMT_BGRA8888_PAT  0x03020001U
-
-/* SSPP fetch config reset value, hwio.h:50.  For *linear* formats the driver
- * does not write this register at all (mdss_mdp_pipe.c:2158-2168 only writes
- * it when fetch_mode != LINEAR), so neither do we. */
-#define SWEET_MDP_FETCH_CONFIG_RESET 0x00000087U
-
-/* CTL_LAYER pipe->stage encoding.
- * mdss_mdp_ctl.c:46-61 mdp_pipe_hwio[] gives, per pipe, a {start,len,shift}
- * bitfield inside CTL_LAYER<n>; the value written is the *stage*:
- *   DMA1 -> { start 21, len 3, shift 0 }            (mdss_mdp_ctl.c:56)
- * Stage index values are enum mdss_mdp_stage_index (hwio.h:442-453):
- *   UNUSED 0, BASE 1, STAGE_0 2, STAGE_1 3, ...
- * Which layer-mixer number the WB mixer is programmed through depends on
- * MDSS_CAPS_MIXER_1_FOR_WB: hw mixer = 1 (if the cap is set) else 3
- * (mdss_mdp_ctl.c:4875-4884), and CTL_LAYER(n) for the WB mixer is
- * CTL_LAYER(3)/CTL_LAYER(4) per the comment at mdss_mdp_ctl.c:4863-4870.
- *  TODO(unverified): which of these two applies to msm8998 -- read
- *  mdata->mdss_caps_map (mdss_mdp_hw_rev_caps_init, mdss_mdp.c:2027+) or,
- *  much better, dump CTL_LAYER registers from a working Android boot.
- * The macro below is the safe/no-WB-cap variant (hw mixer 3).
- */
-#define SWEET_MDP_STAGE_0          2
-#define SWEET_CTL_LAYER_WB_REG     CTL_LAYER(3)
-#define SWEET_CTL_LAYER_WB_VAL     ((uint32_t)SWEET_MDP_STAGE_0 << 21)
-
-/* CTL_FLUSH bits: BIT(pipe->flush_bit) per pipe (mdss_mdp_ctl.c:5446,
- * table mdss_mdp_ctl.c:46-61 -> DMA1 = bit 12), BIT(mixer hw num + 6) for the
- * layer mixer (mdss_mdp_ctl.c:5189) and BIT(16) for WB
- * (mdss_mdp_intf_writeback.c:1053). */
-#define SWEET_FLUSH_DMA1           (1U << 12)
-#define SWEET_FLUSH_LM(hw)         (1U << ((hw) < 5 ? 6 + (hw) : 20))
-#define SWEET_FLUSH_WB             (1U << 16)
-
-/*
- * ---------------------------------------------------------------------------
- * 5. The blit
- */
-
-typedef struct sweet_mdss {
-	volatile uint32_t *mdss;        /* MDSS top (0x0C900000) */
-	volatile uint32_t *mdp;         /* MDP window (0x0C901000) */
-	volatile uint32_t *ctl1;
-	volatile uint32_t *dma1;
-	volatile uint32_t *lm1;
-	volatile uint32_t *wb;
-	volatile uint32_t *mmss_cc;
-	bool               powered;
-} sweet_mdss_t;
+struct sweet_mdp {
+	void                 *ctx;
+	sweet_mdp_write_fn    write;
+	sweet_mdp_read_fn     read;
+};
 
 static inline void
-sweet_io_write(volatile uint32_t *base, uint32_t off, uint32_t val)
+sweet_mdp_wr(struct sweet_mdp *m, uint32_t abs_off, uint32_t val)
 {
-	base[off / 4] = val;
-	__asm__ __volatile__("dsb sy" ::: "memory");
+	m->write(m->ctx, abs_off, val);
 }
 
 static inline uint32_t
-sweet_io_read(volatile uint32_t *base, uint32_t off)
+sweet_mdp_rd(struct sweet_mdp *m, uint32_t abs_off)
 {
-	uint32_t v = base[off / 4];
-	__asm__ __volatile__("dsb sy" ::: "memory");
-	return v;
-}
-
-/* Map a physical range read/write.  Same mechanism the existing tree already
- * uses for the panel memory: IOMemoryDescriptor::withPhysicalAddress()
- * (SweetSurface.cpp:242) followed by map(). */
-static volatile uint32_t *
-sweet_map_phys(uint64_t phys, uint64_t len)
-{
-	IOMemoryDescriptor *md;
-	IOMemoryMap        *map;
-	volatile uint32_t  *va;
-
-	md = IOMemoryDescriptor::withPhysicalAddress(phys, len, kIODirectionOutIn);
-	if (md == NULL) {
-		return NULL;
-	}
-	map = md->map();
-	md->release();
-	if (map == NULL) {
-		return NULL;
-	}
-	va = (volatile uint32_t *)map->getVirtualAddress();
-	/* The map is intentionally leaked for the lifetime of the driver;
-	 * a real implementation keeps the IOMemoryMap and releases it in stop(). */
-	return va;
+	return m->read(m->ctx, abs_off);
 }
 
 /*
- * Turn on the MMSS power domain and the five MDSS clocks.
- *
- * This is the part of the whole exercise with the highest chance of hanging
- * the machine, which is why it is isolated here: if the GDSC never reports
- * "enabled", every later register access faults or hangs the AXI bus.
+ * Program one SSPP for a source rectangle.  Mirrors
+ * sde_hw_sspp_setup_sourceaddress()/..._setup_sourceformat()/
+ * mdp5_plane_atomic_update() (mdp5_plane.c:755-806) but with no scaling:
+ * SRC_SIZE == OUT_SIZE makes the scaler a pass-through, and leaving
+ * SCALE_CONFIG untouched keeps it disabled (mdp5_plane.c:822-825 only writes
+ * it when the state actually scales).
  */
-static bool
-sweet_mdss_power_on(sweet_mdss_t *d)
+static void
+sweet_blit_setup_pipe(struct sweet_mdp *m, uint32_t pipe_base,
+    const struct sweet_blit *b)
 {
-	uint32_t v;
-	int      i;
+	uint32_t src_img = ((b->src_h & 0xFFFFu) << 16) | (b->src_w & 0xFFFFu);
+	uint32_t src_xy  = ((b->src_y & 0xFFFFu) << 16) | (b->src_x & 0xFFFFu);
+	uint32_t src_sz  = ((b->h     & 0xFFFFu) << 16) | (b->w     & 0xFFFFu);
+	uint32_t out_xy  = ((b->dst_y & 0xFFFFu) << 16) | (b->dst_x & 0xFFFFu);
 
-	/* 1. MMSS GDSC.  gdsc.c:29 PWR_ON_MASK = BIT(31); gdsc.c:87-118 polls
-	 *    a status field with udelay(1) between reads.
-	 *     TODO(unverified): the status bit position.  Until it is known,
-	 *     this code must not run on a device we care about. */
-	v = sweet_io_read(d->mmss_cc, SWEET_GDSCR_MDSS - SWEET_MMSS_CC_BASE);
-	sweet_io_write(d->mmss_cc, SWEET_GDSCR_MDSS - SWEET_MMSS_CC_BASE,
-	    v | SWEET_GDSC_PWR_ON);
-	for (i = 0; i < 1000; i++) {
-		IODelay(1);
-		v = sweet_io_read(d->mmss_cc, SWEET_GDSCR_MDSS - SWEET_MMSS_CC_BASE);
-		if ((v & SWEET_GDSC_PWR_ON) && (v & (1U << 16)) != 0) {
-			break;      /*  TODO(unverified): bit 16 is a guess */
-		}
-	}
-	if (i == 1000) {
-		IOLog("SWEET MDP: gdsc_mdss did not come up (0x%08x)\n", v);
-		return false;
-	}
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_SRC_IMG_SIZE, src_img);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_SRC_XY,      src_xy);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_SRC_SIZE,    src_sz);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_OUT_XY,      out_xy);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_OUT_SIZE,    src_sz);
 
-	/* 2. Clocks.  We do not touch MMSS_MDP_CMD_RCGR (0x2040): the rate the
-	 *    bootloader left is assumed good enough for a 1080p blit.  We only
-	 *    ungate the branches: bit 0 of each CBCR (clock-local2.c:68). */
-	static const uint32_t cbcr[] = {
-		SWEET_CBCR_MDSS_AHB, SWEET_CBCR_MDSS_AXI, SWEET_CBCR_MDP,
-		SWEET_CBCR_MDP_LUT,  SWEET_CBCR_VSYNC,
-	};
-	for (i = 0; i < (int)(sizeof(cbcr) / sizeof(cbcr[0])); i++) {
-		uint32_t off = cbcr[i] - SWEET_MMSS_CC_BASE;
-		v = sweet_io_read(d->mmss_cc, off);
-		sweet_io_write(d->mmss_cc, off, v | 1U);
-	}
+	/* Strides: P0 in [15:0], P1 in [31:16] (mdp5.xml.h:774-800).  A single
+	 * plane leaves P1..P3 at zero, which is what mdp5_plane.c:397-402 does
+	 * for the unused planes of a linear format. */
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_SRC_STRIDE_A, b->src_stride);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_SRC_STRIDE_B, 0);
 
-	/* 3. Make sure the MDP's AXI clients are not clock-gated by the
-	 *    per-pipe clock-control fields.  The DT's qcom,mdp-settings replay
-	 *    value for 0x012bc is 0x00cccccc (msm8998-mdss.dtsi:130), i.e. the
-	 *    five 4-bit fields at 0x2BC are all "always on" (0xc).  The Linux
-	 *    driver applies that table at init; XNU has to as well. */
-	sweet_io_write(d->mdp, MDP_CLK_CTRL, 0x00CCCCCC);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_SRC0_ADDR, b->src_phys);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_SRC1_ADDR, 0);
 
-	d->powered = true;
-	return true;
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_SRC_FORMAT,
+	    SWEET_SRC_FORMAT_BGRA8888);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_SRC_UNPACK,
+	    SWEET_SRC_UNPACK_BGRA8888);
+	/* No flip, no deinterlace, no pixel extension (mdp5_plane.c:799-805). */
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + pipe_base + MDP5_PIPE_SRC_OP_MODE, 0);
 }
 
 /*
- * Program one DMA1 -> LM -> WB blit.  No scaling, no rotation, no alpha
- * blending: a straight 32bpp copy, which is exactly what the current
- * CPU memcpy at SweetFramebuffer.cpp:393-399 does.
- *
- * src_phys / dst_phys must be physical addresses of contiguous buffers.
+ * LM0 output size = the destination rectangle position+size, so the mixer
+ * window matches the panel area we are about to overwrite.  sde_hw_lm.c:76-95
+ * (sde_hw_lm_setup_out) writes out_height<<16|out_width to LM_OUT_SIZE and
+ * leaves BIT(31) clear for a non-split mixer.
  */
-static bool
-sweet_mdss_blit(sweet_mdss_t *d,
-    uint64_t src_phys, uint32_t src_stride, uint32_t src_x, uint32_t src_y,
-    uint64_t dst_phys, uint32_t dst_stride, uint32_t dst_x, uint32_t dst_y,
-    uint32_t w, uint32_t h)
+static void
+sweet_blit_setup_lm(struct sweet_mdp *m, uint32_t lm_base,
+    const struct sweet_blit *b)
 {
-	uint32_t v;
-	int      i;
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + lm_base + MDP5_LM_OUT_SIZE,
+	    (((b->dst_y + b->h) & 0xFFFFu) << 16) | ((b->dst_x + b->w) & 0xFFFFu));
+	/* Stage 0 opaque copy: source alpha ignored, no blending. */
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + lm_base + MDP5_LM_BLEND0_FG_ALPHA, 0xFFu);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + lm_base + MDP5_LM_BLEND0_BG_ALPHA, 0u);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + lm_base + MDP5_LM_BLEND0_OP, 0u);
+}
 
-	if (!d->powered && !sweet_mdss_power_on(d)) {
-		return false;
+/*
+ * Writeback destination.  Follows sde_hw_wb_setup_format() (sde_hw_wb.c:81-160)
+ * and sde_hw_wb_setup_outaddress() (sde_hw_wb.c:70-79).
+ */
+static void
+sweet_blit_setup_wb(struct sweet_mdp *m, const struct sweet_blit *b)
+{
+	uint32_t outsize = ((b->h & 0xFFFFu) << 16) | (b->w & 0xFFFFu);
+
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + MSM8998_WB + WB_DST0_ADDR, b->dst_phys);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + MSM8998_WB + WB_DST_YSTRIDE0, b->dst_stride);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + MSM8998_WB + WB_DST_FORMAT,
+	    SWEET_WB_FORMAT_BGRA8888);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + MSM8998_WB + WB_DST_PACK_PATTERN,
+	    SWEET_WB_PACK_BGRA8888);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + MSM8998_WB + WB_DST_OP_MODE, 0);  /* linear */
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + MSM8998_WB + WB_OUT_SIZE, outsize);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + MSM8998_WB + WB_ALPHA_X_VALUE, 0xFFu);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + MSM8998_WB + WB_DST_ADDR_SW_STATUS, 0);
+}
+
+/*
+ * The commit handshake, exactly as mdp5_ctl_commit() does it
+ * (mdp5_ctl.c:495-530): write CTL_FLUSH with the mask of every block that was
+ * reprogrammed, then pulse CTL_START.
+ *
+ * The layer-register value puts DMA0 into stage 0 of LM0:
+ *   mdp5.xml.h:419-420  MDP5_CTL_LAYER_REG_DMA0__MASK = 0x001c0000, __SHIFT 18
+ * so "pipe index 0 in stage 0" is 0 << 18 == 0.  SDE 3.0.0 repacks the layer
+ * registers (sde_hw_ctl.c:345-455 builds mixercfg stage by stage); UNVERIFIED
+ * whether the MDP5 packing above is still correct on 8998.  Read back
+ * CTL_LAYER0 and compare with what the bootloader left there before trusting
+ * this line -- that is the single cheapest experiment in the whole file.
+ */
+static void
+sweet_blit_commit(struct sweet_mdp *m, uint32_t ctl_base, uint32_t flush_mask)
+{
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + ctl_base + MDP5_CTL_LAYER0, 0u);
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + ctl_base + MDP5_CTL_FLUSH, flush_mask);
+	/* CTL_OP: no INTF (virtual/WB pipeline), 2-line WB mode.
+	 * mdp5_ctl.c:148-176 set_ctl_op(); MDP5_CTL_OP_MODE(MODE_WB_2_LINE). */
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + ctl_base + MDP5_CTL_OP, MDP5_CTL_OP_MODE(2u));
+	sweet_mdp_wr(m, MSM8998_MDP_BASE + ctl_base + MDP5_CTL_START, 1u);
+}
+
+/*
+ * Public entry point.  Drop-in replacement for the memcpy loop:
+ *
+ *   SweetFramebuffer::present(), inner loop
+ *     -> sweet_mdss_blit(&fb->fMdp, &blit)
+ *
+ * where blit.src_phys = (uint32_t)(src + s->offset + sy*bpr + sx*4)
+ *                      truncated after the existing bounds checks, and
+ *       blit.dst_phys = (uint32_t)(fPhysBase + dy*fRowBytes + dx*4).
+ * The existing rectangle clipping code at SweetFramebuffer.cpp:352-392 stays
+ * exactly as it is; only the per-row copy disappears.
+ *
+ * Returns 0 on success, -1 if the rectangle is unusable.
+ */
+static int
+sweet_mdss_blit(struct sweet_mdp *m, const struct sweet_blit *b)
+{
+	if (b == NULL || b->w == 0 || b->h == 0) {
+		return -1;
+	}
+	if (b->src_phys == 0 || b->dst_phys == 0) {
+		return -1;
+	}
+	if (b->src_stride < b->w * 4u || b->dst_stride < b->w * 4u) {
+		return -1;
 	}
 
-	/* 0. The WB block must not be busy with a previous kickoff
-	 *    (mdss_mdp_intf_writeback.c:1014-1018 refuses to start twice). */
-	if (sweet_io_read(d->wb, WB_DST_ADDR_SW_STATUS) != 0) {
-		/*  TODO(unverified): this register is written with the secure
-		 *  flag by the driver (intf_writeback.c:1054); reading it as a
-		 *  busy indicator is *not* what the driver does.  A real
-		 *  implementation tracks completion through the interrupt at
-		 *  MDP+0x14 (INTR_WB_2_DONE) or through CTL_START going idle. */
-	}
+	sweet_blit_setup_pipe(m, MSM8998_DMA0_SSPP, b);
+	sweet_blit_setup_lm(m, MSM8998_LM0, b);
+	sweet_blit_setup_wb(m, b);
+	sweet_blit_commit(m, MSM8998_CTL0,
+	    MDP5_FLUSH_DMA0 | MDP5_FLUSH_LM0 | MDP5_FLUSH_WB | MDP5_FLUSH_CTL);
 
-	/* 1. Source pipe: linear BGRA8888, no scaling.
-	 *    Register write order follows mdss_mdp_pipe_setup() /
-	 *    mdss_mdp_format_setup() (mdss_mdp_pipe.c:2097-2196) and
-	 *    mdss_mdp_src_addr_setup() (mdss_mdp_pipe.c:2283-2286). */
-	sweet_io_write(d->dma1, SSPP_SRC_SIZE, (h << 16) | w);      /* packed wh */
-	sweet_io_write(d->dma1, SSPP_SRC_XY, (src_y << 16) | src_x);
-	sweet_io_write(d->dma1, SSPP_OUT_SIZE, (h << 16) | w);
-	sweet_io_write(d->dma1, SSPP_OUT_XY, 0);
-	sweet_io_write(d->dma1, SSPP_SRC0_ADDR,
-	    (uint32_t)(src_phys + (uint64_t)src_y * src_stride +
-	    (uint64_t)src_x * 4));
-	sweet_io_write(d->dma1, SSPP_SRC_YSTRIDE0, src_stride);     /* [15:0] */
-	sweet_io_write(d->dma1, SSPP_SRC_YSTRIDE1, 0);
-	sweet_io_write(d->dma1, SSPP_SRC_FORMAT, SWEET_MDP_FMT_BGRA8888_SRC);
-	sweet_io_write(d->dma1, SSPP_SRC_UNPACK_PATTERN, SWEET_MDP_FMT_BGRA8888_PAT);
-	sweet_io_write(d->dma1, SSPP_SRC_OP_MODE, 0);   /* no flip, no scaler */
-
-	/* 2. Writeback destination (mdss_mdp_writeback_format_setup(),
-	 *    mdss_mdp_intf_writeback.c:502-509 -- same order).
-	 *
-	 *    NOTE the two different "opmode" values, which are easy to
-	 *    confuse:  WB_DST_OP_MODE gets ctx->opmode, which the line/wfd
-	 *    prepare path sets to 0 (intf_writeback.c:636); only YUV, UBWC or
-	 *    rotator add bits to it (:423-442, :487-494, :690-712).
-	 *    CTL_TOP (step 5) gets ctl->opmode = MDSS_MDP_CTL_OP_WB0_MODE = 3
-	 *    (hwio.h:200), chosen from the mixer number at
-	 *    mdss_mdp_wfd.c:259-266. */
-	sweet_io_write(d->wb, WB_ALPHA_X_VALUE, 0xFF);  /* intf_writeback.c:502 */
-	sweet_io_write(d->wb, WB_DST_FORMAT, SWEET_MDP_FMT_BGRA8888_DST);
-	sweet_io_write(d->wb, WB_DST_OP_MODE, 0);       /* intf_writeback.c:636 */
-	sweet_io_write(d->wb, WB_DST_PACK_PATTERN, SWEET_MDP_FMT_BGRA8888_PAT);
-	sweet_io_write(d->wb, WB_DST_YSTRIDE0, dst_stride);
-	sweet_io_write(d->wb, WB_OUT_SIZE, (h << 16) | w);
-	sweet_io_write(d->wb, WB_DST0_ADDR,
-	    (uint32_t)(dst_phys + (uint64_t)dst_y * dst_stride +
-	    (uint64_t)dst_x * 4));
-
-	/* 3. Layer mixer: output size and an opaque stage 0.
-	 *    LM_OUT_SIZE is written by mdss_mdp_mixer_setup()
-	 *    (mdss_mdp_ctl.c:5055); the blend registers per stage are written
-	 *    at mdss_mdp_ctl.c:5176-5181 with the op computed at 5105-5164.
-	 *    For an opaque pipe the driver uses
-	 *    FG_ALPHA_FG_CONST | BG_ALPHA_BG_CONST with fg=0xFF, bg=0x00.
-	 *     TODO(unverified): the stage index.  mdss_mdp_ctl.c:5103-5104
-	 *    shows stage > 3 shifts by LM_BLEND_STAGE4 (0x150), so the index is
-	 *    a small ordinal; stage 0 (enum value 2) is assumed here. */
-	sweet_io_write(d->lm1, LM_OUT_SIZE, (h << 16) | w);
-	sweet_io_write(d->lm1, LM_OP_MODE, 0);
-	sweet_io_write(d->lm1, LM_BLEND_OFFSET(SWEET_MDP_STAGE_0) + LM_BLEND_OP,
-	    BLEND_FG_ALPHA_FG_CONST | BLEND_BG_ALPHA_BG_CONST);
-	sweet_io_write(d->lm1, LM_BLEND_OFFSET(SWEET_MDP_STAGE_0) + LM_BLEND_FG_ALPHA,
-	    0xFF);
-	sweet_io_write(d->lm1, LM_BLEND_OFFSET(SWEET_MDP_STAGE_0) + LM_BLEND_BG_ALPHA,
-	    0x00);
-	sweet_io_write(d->lm1, LM_BORDER_COLOR_0, 0);   /* ctl.c:5200-5203 */
-	sweet_io_write(d->lm1, LM_BORDER_COLOR_1, 0);
-
-	/* 4. Bind DMA1 to the WB mixer's stage 0 (CTL_LAYER<n>).
-	 *    mdss_mdp_ctl.c:4823-4847 (masks) -> :4928-4929 (write). */
-	sweet_io_write(d->ctl1, SWEET_CTL_LAYER_WB_REG, SWEET_CTL_LAYER_WB_VAL);
-
-	/* 5. CTL_TOP: tell the CTL where to send the mixer output.
-	 *    mdss_mdp_ctl.c:5887 writes ctl->opmode here; the opmode value
-	 *    is chosen at mdss_mdp_wfd.c:259-266 and is
-	 *    MDSS_MDP_CTL_OP_WB0_MODE = 0x3 (hwio.h:200) when the assigned
-	 *    mixer is MDSS_MDP_WB_LAYERMIXER0.  The "& 0xF" of that value is
-	 *    the writeback selector: mem_sel = (opmode & 0xF) - 1
-	 *    (mdss_mdp_intf_writeback.c:1084-1087), i.e. 0x3 -> wb_ctx_list[2]
-	 *    = WRITEBACK_TYPE_LINE (intf_writeback.c:96-103).
-	 *     TODO(unverified): that the mixer really is WB_LAYERMIXER0 here --
-	 *    if it is WB_LAYERMIXER1 the value becomes 0x4 and the CTL_LAYER
-	 *    register below must change too. */
-	sweet_io_write(d->ctl1, CTL_TOP, CTL_OP_WB0_MODE);
-
-	/* 6. Flush the blocks we touched, then start.
-	 *    Flush bits: DMA1 BIT(12), LM BIT(6+hw), WB BIT(16)
-	 *    (intf_writeback.c:1052-1055, mdss_mdp_ctl.c:5189, :5446). */
-	v = SWEET_FLUSH_DMA1 | SWEET_FLUSH_WB | SWEET_FLUSH_LM(3);
-	sweet_io_write(d->ctl1, CTL_FLUSH, v);
-	sweet_io_write(d->ctl1, CTL_START, 1);      /* intf_writeback.c:1069 */
-
-	/* 7. Wait for WB done.  The driver waits on the WB interrupt
-	 *    (intf_writeback.c:1059 enables MDSS_MDP_IRQ_TYPE_WB_ROT_COMP and
-	 *    mdss_mdp_wb_wait4comp() sleeps on a completion, :922-999); XNU has
-	 *    no MDSS interrupt handler yet, so poll MDP+0x14 instead.
-	 *    IRO 83 is the MDP's SPI (msm8998-mdss.dtsi:20). */
-	for (i = 0; i < 200; i++) {                 /* 200 x 100us = 20 ms */
-		v = sweet_io_read(d->mdp, MDP_INTR_STATUS);
-		if (v & INTR_WB_2_DONE) {
-			break;
-		}
-		IODelay(100);
-	}
-	sweet_io_write(d->mdp, MDP_INTR_CLEAR, INTR_CLEAR_ALL_WB);
-	if (i == 200) {
-		IOLog("SWEET MDP: blit timed out, INTR_STATUS 0x%08x CTL_START %u\n",
-		    v, sweet_io_read(d->ctl1, CTL_START));
-		return false;
-	}
-	return true;
+	return 0;
 }
 
 /*
  * ---------------------------------------------------------------------------
- * 6. How this replaces the memcpy in SweetFramebuffer::present()
- *
- * Today (SweetFramebuffer.cpp:393-399):
- *
- *     if (src != 0 && bpe == 4) {
- *             for (int32_t y = 0; y < h; y++) {
- *                     memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes +
- *                         (uint64_t)dx * 4),
- *                         (const void *)(src + s->offset +
- *                         (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
- *                         (size_t)w * 4);
- *             }
- *     }
- *
- * The hardware equivalent is one call:
- *
- *     sweet_mdss_blit(&g_mdss,
- *         src_phys_of(s) + s->offset, s->bytesPerRow, sx, sy,
- *         fPhys,                      fRowBytes,       dx, dy, w, h);
- *
- * ...where src_phys_of() is the *physical* address of the surface's backing
- * store.  That is the hard part, and it is not a driver problem:
- *
- *   - SweetSurface allocates its pixels with
- *       IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
- *           kIODirectionInOut | kIOMemoryKernelUserShared, allocSize, page_size)
- *     (SweetSurface.cpp:691-692), i.e. page-based and NOT physically
- *     contiguous.  There is no SMMU driver in the XNU tree today
- *     (`grep -ril smmu iokit/Kernel/arm/` is empty), so the MDP can only be
- *     pointed at physical addresses.
- *   - XNU can allocate contiguous memory (kIOMemoryPhysicallyContiguous +
- *     kIOMemoryMapperNone -> IOKernelAllocateWithPhysicalRestrict(),
- *     iokit/Kernel/IOBufferMemoryDescriptor.cpp:302-326), but a 1080x2400
- *     BGRA surface is 10,368,000 bytes = ~633 pages of 16 KB and the
- *     allocation can fail on a fragmented boot.  That has to be measured,
- *     not assumed.
- *   - The panel memory (fPhys, from PE_Video) is a fixed physical window the
- *     display controller is already scanning out, so the *destination* is
- *     fine as it stands.
- *
- * If contiguous surfaces turn out to be unobtainable, the alternatives are
- * (a) one blit per row from a staging buffer (pointless), (b) keep the CPU
- * copy, or (c) write an MMSS SMMU driver and map surfaces into a context
- * bank -- the "correct" answer and a much bigger project (see the report).
+ * 4. What a real implementation still needs
+ * ---------------------------------------------------------------------------
+ *  a) Map MDP_BASE (0x90000 bytes) + VBIF (0x1040) as two IOKit memory ranges
+ *     from the /arm-io/mdss_mdp node, and wire sweet_mdp.write/read to
+ *     OSWriteLittleInt32/OSReadLittleInt32.
+ *  b) Wait for completion.  The MDP raises GIC SPI 83 (msm8998-mdss.dtsi:20),
+ *     and the WB block has its own done bit; the cheap interim is to poll
+ *     WB_DST_ADDR_SW_STATUS (sde_hw_wb.c:45) or simply to trust the flush and
+ *     delay one vsync, because present() already runs on a timer.
+ *  c) Decide CONFIG/ownership: the bootloader's MDP state is unknown.  Read
+ *     MDP_TOP + 0x0 (MDP_HW_VERSION, mdp5.xml.h:211-231) first: a non-zero
+ *     major/minor proves the block is clocked and the mapping is right.  That
+ *     single read is the go/no-go for the whole option.
+ *  d) If SRC0_ADDR is not honoured (SMMU enforcing), fall back to allocating
+ *     the source through an SMMU domain, or copy the surface once into a
+ *     bounce buffer that the bootloader already mapped.
+ *  e) Never enable this while the on-screen console is the kernel's text
+ *     console: present() currently pauses it on the first swap
+ *     (SweetFramebuffer.cpp:317-325).
  */
+
+#endif /* __IOS_SWEET_MDSS_BLIT_SKELETON__ */
