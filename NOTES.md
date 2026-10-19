@@ -2,6 +2,58 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #2: link-level verification on Linux (ld64.lld) <<<
+
+**Question asked: "did the build start?" No -- and this update is about how far
+the boundary could be pushed without a macOS runner.**
+
+`ld64.lld` (Ubuntu's `apt install lld`, at `/usr/lib/llvm-18/bin/ld64.lld`)
+links Mach-O on Linux: it produces `Mach-O 64-bit arm64 executable` with
+`NOUNDEFS`. `-r` (relocatable) needs `-platform_version` and still fails, so a
+true partial link is not available, but a full link of our objects plus a stub
+entry works.
+
+New tool: **`tools/xnu-linkcheck.py TREE [--all-touched]`**
+
+1. compiles the objects (via `tools/xnu-localcc.py`'s environment),
+2. extracts their undefined symbols and demangles them (`llvm-cxxfilt`; without
+   demangling every C++ symbol looks orphaned -- `_Z18sweet_surface_copyj`),
+3. links them with `ld64.lld` to catch **duplicate definitions**,
+4. builds a symbol index of the whole tree (3282 files, 174k identifiers) and
+   reports undefined symbols that **nothing** in the tree defines.
+
+Result on the current tree:
+
+```
+10/10 files compile
+duplicate definitions among the checked objects: none
+601 undefined symbols total, 601 found in the tree, 0 NOT found
+```
+
+**The tool's own bugs, found by using it.** First run reported 501 orphan
+symbols -- all false. Three causes, all fixed:
+- no demangling (fixed with llvm-cxxfilt);
+- the index missed multi-line definitions (name on its own line, `(` on the
+  next), so `sweet_hid_touch` etc. looked undefined;
+- XNU's assembler macros `EXT(name)` / `LEXT(name)` were not indexed, which hid
+  `sweet_secondary_entry` (defined in `osfmk/arm64/start.s:289`).
+
+I verified by hand that all 7 initially-flagged `sweet_*` symbols really are
+defined (`SweetHID.cpp:553,566`, `sweet_ufs.c:713,730`, `sweet_rpmh.c:328`,
+`cpu.c:970`, `start.s:289`). The remaining 4 are C++ ABI runtime
+(`_Unwind_Resume`, `__cxa_atexit`, `__cxa_begin_catch`, `__gxx_personality_v0`),
+supplied by the C++ runtime the real kernel build links, now listed in
+`EXPECTED_EXTERNAL`.
+
+**What this now proves beyond the compile check:**
+- no duplicate definitions among the objects (a real link error on any platform);
+- no orphan undefined symbols (a real link error on any platform);
+- symbol names match what the rest of the kernel actually defines.
+
+**What it still does not prove:** the real kernel link. Missing on Linux:
+`ctfconvert`, `ctfmerge`, `mig`, `iig`, and the full link against the KDK's
+closed kexts. A kernel build still needs the macOS runner.
+
 ### >>> UPDATE 2026-10-20: XNU now compiles on Linux (no macOS needed) <<<
 
 **The question was "can't we just run it locally?" The answer is yes, mostly.**
