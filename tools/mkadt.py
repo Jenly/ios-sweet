@@ -132,7 +132,11 @@ def build(seed=None, qemu=False, highmem=None, device='sweet'):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr(dev['cpu_compatible']) + cstr('ARM,v8')),
+            # SoC marketing string, then the board-independent one the SweetCPU
+            # personality matches (xnu patch 0083), then the ISA level.
+            ('compatible', b''.join(cstr(c) for c in
+                (dev['cpu_compatible'], 'ios-sweet,cpu', 'ARM,v8'))),
+            ('cpu-name', cstr(dev['cpu_name'])),
             ('reg', u32(mpidr)),         # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),       # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),      # descriptive; see ml_parse_cpu_topology

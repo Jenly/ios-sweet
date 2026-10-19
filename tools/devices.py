@@ -57,7 +57,8 @@ DEVICES = {
         # AppleCLCD matches any of these; the board-specific string keeps a
         # kernel built before patch 0082 working with a new ADT.
         display_match=("ios-sweet,display", "sweet,display"),
-        cpu_compatible="qcom,kryo470",
+        cpu_compatible="qcom,kryo470",   # + 'ios-sweet,cpu' from mkadt.py
+        cpu_name="Kryo 470",             # Cortex-A76 + A55; goes into the log
         # RAM windows for the kernel.  low: above every Qualcomm carve-out
         # (see NOTES.md); high: the whole upper DDR bank (--highmem).
         ram_low=(0xb0000000, 0x4d000000),
@@ -105,7 +106,8 @@ DEVICES = {
         board_compat=("xiaomi,chiron", "qcom,msm8998"),
         platform_match="ios-sweet",
         display_match=("ios-sweet,display", "chiron,display"),
-        cpu_compatible="qcom,kryo280",
+        cpu_compatible="qcom,kryo280",   # + 'ios-sweet,cpu' from mkadt.py
+        cpu_name="Kryo 280",             # 4x Cortex-A73-class + 4x A53; goes into the log
         # Live DT: memory@0 = <0x0 0x40000000 0x0 0xc0000000>, memory@1 =
         # <0x1 0x0 0x0 0xbd8c0000> (6 GiB variant).  The low bank holds every
         # PIL/splash carve-out up to 0x9fa00000, so the kernel window starts

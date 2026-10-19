@@ -1,0 +1,65 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..7f752bb 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -10,6 +10,7 @@
+ #include <IOKit/IOLib.h>
+ #include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
+ #include <arm64/proc_reg.h>
+ #include <machine/atomic.h>
+ #include <kern/clock.h>
+@@ -70,19 +71,36 @@ SweetCPU::start(IOService *provider)
+ 		return false;
+ 	}
+ 	const ml_topology_cpu_t *cpu = &topology->cpus[logical->unsigned32BitValue()];
++	OSString *name;
++
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/*
++	 * Any MPIDR encoding is accepted as long as it is a plausible one:
++	 * Aff0/Aff1/Aff2 in the low 16 bits, no Aff3, and one node per core.
++	 * sweet puts all eight cores at Aff1 = 0..7 (Aff0 = 0); chiron has the
++	 * four Gold cores at 0x000-0x003 and the Silver cluster at
++	 * 0x100-0x103, so an "Aff0 must be 0" test would panic there.
++	 */
++	if ((cpu->phys_id & ~0xffffffU) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
++	for (unsigned int i = 0; i < topology->num_cpus; i++) {
++		if (i != cpu->cpu_id && topology->cpus[i].phys_id == cpu->phys_id) {
++			panic("SWEET CPU: duplicate mpidr 0x%x for cpu %u and %u",
++			    cpu->phys_id, cpu->cpu_id, i);
++		}
++	}
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	/* The core's marketing name, from the device tree ("cpu-name"), so the
++	 * log says Kryo 470 on SM7150 and Kryo 280 on MSM8998. */
++	name = OSDynamicCast(OSString, provider->getProperty("cpu-name"));
++	cpuName = OSSymbol::withCString(name != NULL ? name->getCStringNoCopy() : "Kryo");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 20561e5..d892073 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -44,7 +44,7 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'qcom,kryo470';"
++    "     'IONameMatch'     = 'ios-sweet,cpu';"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"

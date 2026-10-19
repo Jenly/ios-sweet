@@ -193,6 +193,7 @@ What is already done and checked (no hardware access needed):
 - `shim/build.sh --device chiron` builds `shim/out/shim-boot-chiron.img` with the chiron `devcfg.h` and the edk2 `Android-chiron.dtb` embedded.
 - `tools/mkadt.py --device chiron` emits a 6 GiB upper-bank ADT with the chiron GIC redistributor (`0x17b00000`), timer INTID 27, UFS at `0x1da4000` and a 1080×2160 panel presented as the iPhone X screen.
 - Patch 0082 makes the kernel read those values from the ADT instead of assuming sweet, and keeps the SM7150-only drivers (GENI touch, PM6150 keys, the DWC3 wrapper at `0x0a600000`) off on MSM8998.
+- Patch 0083 removes the two remaining sweet assumptions in the CPU bring-up: the `SweetCPU` personality matched `qcom,kryo470` only, and the topology check panicked unless every MPIDR had Aff0 = 0 (chiron's Silver cluster is `0x100-0x103`).
 
 What is still missing, in the order it will be needed on hardware:
 
@@ -257,6 +258,7 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | 0069 | Batched persistent-log flushes |
 | 0070–0081 | Hibernation PID, touch edges, DWC3 USB device + ECM networking, 8-core SMP, display power, network tracing |
 | 0082 | Board-agnostic display and device detection: the presented screen size, the panel crop and the DPI come from `/arm-io/disp0`; the SM7150-only drivers (touch, keys, USB) switch off on other SoCs (`pexpert/SweetBoard.h`) |
+| 0083 | Board-agnostic CPU topology: any MPIDR encoding (sweet's Aff1-only cores and chiron's `0x000-0x003` + `0x100-0x103` clusters), the core name from the device tree, `ios-sweet,cpu` personality |
 
 ## Key hardware facts
 
