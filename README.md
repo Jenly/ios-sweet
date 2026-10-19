@@ -4,11 +4,19 @@
 
 This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
 
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU. There is no GPU driver, and on chiron there is additionally an MDP5 hardware blit behind `sweetmdss=2` (patch 0084) which composites frames in the display controller instead — it has not been tried on hardware and verifies its own first frame before it trusts itself with the rest.
 
 Since **2026-10-19** the port is board-agnostic (patch `0082`): every SoC and panel constant lives in one table, `tools/devices.py`, the boot shim and the kernel read their hardware from the generated device tree, and the same kernel binary is meant to serve both boards. `chiron` (Mi MIX 2, MSM8998 / Snapdragon 835) is wired up as the second device but has **not been booted on hardware yet**; see [Supported devices](#supported-devices).
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
+
+> **Read [docs/STATUS.md](docs/STATUS.md) first if you are picking this up.**
+> It separates what has been *verified* (full macOS builds, host tests that were
+> shown able to fail, constants traced to cited source lines) from what has merely
+> been *written*, ranks the remaining unknowns by how likely each is to be the
+> first thing that breaks, and states plainly that **nothing here has ever run on
+> a Xiaomi Mi MIX 2**. The most valuable next step is named there too: an EFI
+> wrapper for the shim.
 
 ## Supported devices
 
@@ -263,6 +271,19 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | 0082 | Board-agnostic display and device detection: the presented screen size, the panel crop and the DPI come from `/arm-io/disp0`; the SM7150-only drivers (touch, keys, USB) switch off on other SoCs (`pexpert/SweetBoard.h`) |
 | 0083 | Board-agnostic CPU topology: any MPIDR encoding (sweet's Aff1-only cores and chiron's `0x000-0x003` + `0x100-0x103` clusters), the core name from the device tree, `ios-sweet,cpu` personality |
 | 0082 (cont.) | `bsd/dev/chiron_touch.c` + `chiron_touch_proto.h`: Synaptics RMI4 / FocalTech touch on MSM8998's BLSP I²C5 (QUP **v2**, no bootloader firmware needed — unlike sweet's GENI). Wire-format helpers unit-tested on the host by `tools/test-chiron-touch.sh` |
+| 0084 | `bsd/dev/msm8998_mdss.{c,h}`: MDP5 writeback blit for the MSM8998 display block (MDP5, not SDE), wired into `AppleCLCD::present()`. Off by default: `sweetmdss=1` reads `MDP_HW_VERSION` only, `sweetmdss=2` attempts a blit and verifies the first scanline against the CPU-drawn frame, disabling itself on failure. Register encoding unit-tested by `tools/test-mdss.sh` (32 checks) |
+| 0085 | `bsd/dev/sweet_spmi_v1.{c,h}` + `sweet_pm8998_reg.{c,h}`: SPMI PMIC-Arbiter **v1** (MSM8998's generation; SM7150 uses v5) and the PM8998 regulator map behind an arbiter abstraction, so `SweetBattery.cpp` no longer assumes SM7150. Regulator writes gated by `sweetpmic=1`, set-only, L6/L14 whitelisted, bus proven alive before writing |
+| 0086 | `bsd/dev/chiron_keys.c`: volume key on PM8998 GPIO6 over SPMI (`0xC508`, STATUS1 bit 0). Read-only — diagnoses the pin, never reprograms it |
+| 0087 | `bsd/dev/sweet_hwprobe.c`: read-only hardware report at the top of UFS init, gated by `sweethwprobe=1`. Decodes MDSS / UFS / USB / TLMM / PMIC state so a boot that dies immediately still says what the machine looked like |
+| 0088 | `sweet_usb.c` per-SoC table: MSM8998's USB addresses (GCC `0xB0000`, DWC3 `0xa800000`, QUSB2 `0xc012000`) instead of SM7150's hardcoded ones. Sweet's values unchanged. Checked against the device trees by `tools/test-usb-soc.py` (53 checks) |
+| 0089 | `bsd/dev/sweet_restart.{c,h}`: `PE_halt_restart` installed for MSM8998, so `reboot(2)` and power-off stop being no-ops. Writes the IMEM restart reason, then deasserts PS_HOLD — but only after proving the register reads as asserted. SM7150 excluded rather than guessed. Safety rule unit-tested by `tools/test-restart.sh` (16 checks) |
+
+Four of these six (0084, 0085, 0086's companion rails, 0087) are **off by
+default**. That is deliberate: none has run on hardware, and a bring-up kernel that
+takes over hardware paths it cannot verify is harder to debug than one that reports
+first. `sweethwprobe=1` is the intended first boot; see
+[docs/STATUS.md](docs/STATUS.md) for the ranked list of what will probably break
+first.
 
 ## Key hardware facts
 

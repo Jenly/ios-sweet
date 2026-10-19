@@ -2,6 +2,35 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #16: an honest status document, and the README caught up <<<
+
+`docs/STATUS.md` is new and is the first thing the README points at. It exists
+because **a green CI tick is easy to misread**, and this bring-up now has nine
+checks passing on code that has never touched the phone.
+
+Every claim in it carries a tag -- **[compiled]**, **[host]**, **[read]**,
+**[shipped]**, **[unverified]** -- and the unknowns are ranked by how likely each
+is to be the first thing that breaks. The ranking's top entry is not a driver at
+all: it is the missing **EFI wrapper for the shim**, because until that exists
+nothing below it can be tried.
+
+Writing it caught three numbers I had stated from memory and had wrong: defined
+symbols (70,923, not 70,863+), touch host assertions (24, not 25), and the
+drift-checked file count (12 -- the two new files brought it up from ten). All
+three were re-measured before publication.
+
+**The README's patch table stopped at 0083.** Six patches -- the MDP5 blit, the
+SPMI arbiter, the PM8998 regulators, the volume key, the hardware report, the reset
+hook -- and their drivers were not mentioned anywhere, so a reader would have
+concluded they did not exist. All six are now rows in the table, and the table says
+which are **off by default**, because four of them are and that is the detail
+someone about to boot needs most.
+
+The README also claimed "rendering runs entirely on the CPU" with no qualification.
+That is still true of the default path but no longer the whole picture, so it now
+names `sweetmdss=2` and says the blit verifies its own first frame before trusting
+itself with the rest.
+
 ### >>> UPDATE 2026-10-20 #15: the new CI gate fired, on itself <<<
 
 Run `39316766833` failed at step 4 and skipped the build. That is the gate working
