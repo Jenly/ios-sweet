@@ -1,0 +1,174 @@
+/*
+ * chiron_keys.c -- volume buttons on MSM8998 / PM8998 (chiron).
+ *
+ * WHY THIS EXISTS. bsd/dev/sweet_keys.c polls volume-up through the **v5**
+ * arbiter at SM7150 addresses (0x0c440000) and returns early on any board that
+ * is not sweet (sweet_keys.c:137). So on chiron there are no hardware buttons at
+ * all. That matters beyond convenience: the volume-up + power chord is the usual
+ * way out of a wedged boot, and a phone with no buttons has none.
+ *
+ * HARDWARE. chiron's volume-up is PM8998 GPIO 6, active low
+ * (xiaomi/chiron-msm8998-mtp.dtsi:690-697):
+ *
+ *     vol_up { gpios = <&pm8998_gpios 6 0x1>; linux,code = <115>; }
+ *
+ * Register layout, all from this workspace's kernel sources rather than a
+ * datasheet guess:
+ *
+ *   PM8998 GPIO n lives at 0xC000 + 0x100 * (n - 1)
+ *       (msm-pm8998.dtsi:82-90, "gpio@c000 { reg = <0xc000 0x100> }")
+ *       so GPIO 6 -> 0xC500
+ *
+ *   Within that block (drivers/gpio/qpnp-pin.c:35-39):
+ *       +0x08 STATUS1
+ *           bit 0  input value       (Q_REG_STATUS1_VAL_MASK)
+ *           bit 7  GPIO enabled      (Q_REG_STATUS1_GPIO_EN_MASK)
+ *
+ *   SPMI peripheral: GPIO 5..8 are the second PM8998 GPIO peripheral, 0x11
+ *   (0xC400..0xC700). PM8998 is SPMI slave 0 (msm-pm8998.dtsi:18), so the PPID
+ *   is (0 << 8) | 0x11.
+ *
+ * READ ONLY, like every other PMIC path in this port: the only bus operation is
+ * sweet_spmi_v1_read(), which issues EXT_READL. Nothing here configures the pin,
+ * acknowledges an interrupt, or writes to the PMIC. The pin's direction and pull
+ * are the bootloader's business and are only *diagnosed* here, never repaired:
+ * a kernel that reconfigures a PMIC GPIO on a phone it has never booted is how
+ * you lose the power button too.
+ *
+ * Polling, not interrupts: the PMIC GPIO interrupt path needs the SPMI IRQ
+ * controller, which this port does not have. At 50 ms a poll is invisible to a
+ * human and costs two SPMI transactions.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <kern/clock.h>
+#include <kern/thread.h>
+#include <kern/sched_prim.h>
+#include <pexpert/pexpert.h>
+#include <pexpert/SweetBoard.h>
+
+#include "sweet_spmi_v1.h"
+
+extern void sweet_hid_key(int key, int down);
+
+void chiron_keys_init(void);
+
+/* PM8998 GPIO 6, from msm-pm8998.dtsi:82-90 */
+#define CK_GPIO6_STATUS     0xC508u
+#define CK_GPIO_VAL_MASK    0x01u   /* qpnp-pin.c:36 */
+#define CK_GPIO_EN_MASK     0x80u   /* qpnp-pin.c:38 */
+
+/* HID usage for volume up in the port's key map (sweet_keys.c uses the same). */
+#define CK_KEY_VOLUME_UP    0x80
+
+#define CK_POLL_MS          50u
+
+static int  ck_sleep_chan;
+static bool ck_started;
+
+static void
+ck_wait_ms(unsigned ms)
+{
+	uint64_t deadline;
+
+	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+	(void)assert_wait_deadline(&ck_sleep_chan, THREAD_UNINT, deadline);
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
+/*
+ * One read of the GPIO status byte. Returns 0 on success. The caller decides
+ * what the bits mean, so a firmware that left the pin misconfigured is reported
+ * once rather than silently ignored.
+ */
+static int
+ck_gpio_status(uint8_t *out)
+{
+	return sweet_spmi_v1_read(0, CK_GPIO6_STATUS, out);
+}
+
+static void
+chiron_keys_thread(void *arg, wait_result_t result)
+{
+	bool    down = false;
+	bool    warned_disabled = false;
+	uint8_t status = 0;
+
+	(void)arg;
+	(void)result;
+
+	for (;;) {
+		if (ck_gpio_status(&status) == 0) {
+			/*
+			 * Diagnose the pin once. qpnp-pin's enable bit says whether
+			 * the GPIO block is powered and driving its input path; if it
+			 * is clear the value bit means nothing, and pretending
+			 * otherwise would produce a button that randomly "works".
+			 */
+			if (!(status & CK_GPIO_EN_MASK)) {
+				if (!warned_disabled) {
+					warned_disabled = true;
+					printf("CHIRON KEYS: PM8998 GPIO6 not enabled "
+					    "(status %#x); volume-up unavailable\n", status);
+				}
+			} else {
+				/* active low: the pin reads 0 while pressed */
+				bool now = (status & CK_GPIO_VAL_MASK) == 0;
+
+				if (now != down) {
+					down = now;
+					sweet_hid_key(CK_KEY_VOLUME_UP, down ? 1 : 0);
+					printf("CHIRON KEYS: volume-up %s\n",
+					    down ? "down" : "up");
+				}
+			}
+		}
+		ck_wait_ms(CK_POLL_MS);
+	}
+}
+
+void
+chiron_keys_init(void)
+{
+	int enabled = 0;
+	uint8_t status = 0;
+	thread_t thread;
+	kern_return_t kr;
+
+	if (ck_started) {
+		return;
+	}
+
+	/* Same opt-in shape as chiron_touch: default off, force with a boot-arg. */
+	if (!PE_parse_boot_argn("chironkeys", &enabled, sizeof(enabled))) {
+		if (!sweet_board_is_chiron()) {
+			return;
+		}
+	} else if (enabled == 0) {
+		printf("CHIRON KEYS: disabled (chironkeys=0)\n");
+		return;
+	}
+
+	if (sweet_spmi_v1_init() != 0) {
+		printf("CHIRON KEYS: no SPMI arbiter; buttons unavailable\n");
+		return;
+	}
+	if (ck_gpio_status(&status) != 0) {
+		printf("CHIRON KEYS: PM8998 GPIO6 unreadable; buttons unavailable\n");
+		return;
+	}
+
+	ck_started = true;
+	printf("CHIRON KEYS: PM8998 GPIO6 status %#x (%s, %s)\n", status,
+	    (status & CK_GPIO_EN_MASK) ? "enabled" : "disabled",
+	    (status & CK_GPIO_VAL_MASK) ? "released" : "pressed");
+
+	kr = kernel_thread_start(chiron_keys_thread, NULL, &thread);
+	if (kr != KERN_SUCCESS) {
+		printf("CHIRON KEYS: kernel_thread_start failed %d\n", kr);
+		ck_started = false;
+		return;
+	}
+	thread_deallocate(thread);
+}

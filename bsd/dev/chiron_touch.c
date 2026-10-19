@@ -49,6 +49,9 @@
 #include "chiron_touch_proto.h"
 #include "sweet_pm8998_reg.h"
 
+/* Sibling bring-up for the PM8998 volume key (chiron_keys.c). */
+void chiron_keys_init(void);
+
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
 extern void sweet_hid_touch(int finger, int down, int x, int y);
@@ -927,6 +930,12 @@ chiron_touch_init(void)
 		printf("CHIRON TOUCH: disabled (chirontouch=0)\n");
 		return;
 	}
+	/*
+	 * Buttons first: if the touch probe below blocks, or the thread never
+	 * gets scheduled, the phone must still have a working volume key.
+	 */
+	chiron_keys_init();
+
 	if (kernel_thread_start(chiron_touch_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {

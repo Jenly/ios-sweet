@@ -2,6 +2,52 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #8: chiron volume key (patch 0086) <<<
+
+**A functional gap, not a compile gap.** All the driver files carry
+`#if defined(ARM64_BOARD_CONFIG_SWEET)`, and that macro is defined by the SWEET
+machine config which chiron *shares* -- so everything compiles in on both boards.
+I verified that against the built kernel rather than trusting the guard: every
+symbol (`_chiron_touch_init`, `_sweet_mdss_blit`, `_sweet_keys_init`,
+`_sweet_spmi_v1_init`) is present. My first check claimed they were all ABSENT;
+that was a bug in the check itself (`set -o pipefail` plus `grep -q` -- grep exits
+early, nm dies of SIGPIPE, the pipeline reports failure). Worth remembering: a
+guard named after one board does not mean the other board is excluded.
+
+The real gap was runtime. `sweet_keys.c` polls volume-up through the **v5**
+arbiter at SM7150 addresses and returns early on any board that is not sweet
+(`sweet_keys.c:137`). So chiron had no hardware buttons -- and on a phone with no
+removable battery, the volume chord is the usual escape from a wedged boot.
+
+New `bsd/dev/chiron_keys.c`: PM8998 GPIO 6, active low
+(`chiron-msm8998-mtp.dtsi:690-697`, `gpios = <&pm8998_gpios 6 0x1>`,
+`linux,code = <115>`).
+
+| item | value | source |
+|---|---|---|
+| GPIO 6 block | `0xC000 + 0x100*(6-1)` = `0xC500` | `msm-pm8998.dtsi:82-90` |
+| STATUS1 | `+0x08` | `qpnp-pin.c:35` |
+| input value | bit 0 | `qpnp-pin.c:36` |
+| GPIO enabled | bit 7 | `qpnp-pin.c:38` |
+| SPMI peripheral | `0x11`, slave 0 | GPIO 5..8 are `0xC400..0xC700` |
+
+Read-only, like every other PMIC path here: the only bus operation is
+`sweet_spmi_v1_read()`, which issues EXT_READL. The pin's direction and pull are
+the bootloader's business and are **diagnosed, never repaired** -- a kernel that
+reconfigures a PMIC GPIO on a phone it has never booted is how you lose the power
+button too. If the GPIO enable bit is clear it says so once instead of producing a
+button that randomly works.
+
+It is started **before** the touch thread on purpose: if the touch probe blocks,
+the phone must still have a working volume key.
+
+Polling at 50 ms rather than interrupts, because the PMIC GPIO interrupt path
+needs the SPMI IRQ controller this port does not have.
+
+Verified: 0001-0086 applies with 0 failures, 10/10 TUs compile, 618/618
+undefined symbols resolve with 0 orphans, header-export clean, drift check passes
+for all nine files the series creates. Not run on hardware.
+
 ### >>> UPDATE 2026-10-20 #7: PM8998 regulator control (still patch 0085) <<<
 
 chiron's touch controller is powered from `pm8998_l6` (vdd) and `pm8998_l14`

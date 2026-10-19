@@ -195,7 +195,8 @@ echo "patch/src drift check"
 for src in bsd/dev/chiron_touch.c bsd/dev/chiron_touch_proto.h \
            bsd/dev/sweet_spmi_v1.c bsd/dev/sweet_spmi_v1.h \
            bsd/dev/sweet_pm8998_reg.c bsd/dev/sweet_pm8998_reg.h \
-           bsd/dev/msm8998_mdss.c bsd/dev/msm8998_mdss.h; do
+           bsd/dev/msm8998_mdss.c bsd/dev/msm8998_mdss.h \
+           bsd/dev/chiron_keys.c; do
 	[ -f "$src" ] || { echo "  $src missing" >&2; exit 1; }
 	# Rebuild the file the way the whole series does, not from one patch:
 	# a file created by 0082 and modified by 0085 has to match the pair.
