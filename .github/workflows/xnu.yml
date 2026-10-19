@@ -67,6 +67,14 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
+      - name: Host checks
+        # Seconds, not minutes, and they catch the mistakes a macOS build cannot
+        # see: a register constant derived wrong, a per-SoC table copied instead
+        # of read, a patch that no longer matches its source. Failing here means
+        # nobody waits eight minutes to find out.
+        run: |
+          ./tools/test.sh
+
       - name: Build
         working-directory: dxb
         env:

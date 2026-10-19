@@ -2,6 +2,35 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #14: the host tests now gate CI <<<
+
+**Every check written this session ran only when someone typed its name.** The
+kernel workflow built and stopped there, so a wrong register constant, a per-SoC
+table copied instead of read, or a patch that no longer matched its source would
+all have shipped green.
+
+`tools/test.sh` is the single entry point, and the workflow now runs it as step 4
+-- **before** Build, because these take seconds and the build takes minutes:
+
+| check | what it protects |
+|---|---|
+| MDP5 register encoding | `SRC_FORMAT`/`SRC_UNPACK`/`CTL_FLUSH` re-derived from the Linux bitfields (32 checks) |
+| PSHOLD preflight | the safety rule that decides whether `reboot(2)` may write to the PMIC at all (16 checks, two-way 1M-value sweep) |
+| USB SoC table | six per-SoC facts against `msm-clocks-hwio-8998.h` and the device trees (53 checks) |
+| touch protocol + drift | the RMI4 wire format, and that every file in the repo matches what the patch series produces |
+| shim FDT | `shim/fdt.c` against a dtc-built DTB |
+| board header vs ADTs | sweet still presents 1125x2436 at 22,18 and chiron 1125x2436 at 22,0 |
+
+Nine checks total, 0 skipped, all passing. `--tree DIR` adds the three that need a
+patched tree (header export, compile, link); those stay out of CI on purpose
+because they would duplicate the build's own verdict.
+
+Two bugs in the wrapper itself, both found by running it rather than reading it:
+the `.py` tests are not executable, so `[ -x ]` skipped three of them silently, and
+my first attempt to wire the workflow in reported success while PowerShell had
+truncated the command at `&&` and the edit never ran. Both fixed; the second is why
+the YAML was re-parsed afterwards and the step order printed.
+
 ### >>> UPDATE 2026-10-20 #13: reboot(2) actually works now (patch 0089) <<<
 
 **A functional hole, not a missing feature.** `PE_halt_restart` is assigned nowhere
