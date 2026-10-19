@@ -55,6 +55,8 @@ extern void sweet_touch_init(void);
 extern void chiron_touch_init(void);
 /* Read-only hardware report for the first boot (sweet_hwprobe.c). */
 extern void sweet_hwprobe_run(void);
+/* SoC reset / power-off via PSHOLD (sweet_restart.c). */
+extern int sweet_restart_init(void);
 extern void sweet_usb_probe(void);
 
 #define REG_CAP         0x00
@@ -600,6 +602,13 @@ sweet_ufs_init(void)
 	 * the machine looked like. Read-only, and behind sweethwprobe=1.
 	 */
 	sweet_hwprobe_run();
+
+	/*
+	 * Take over reboot only if PSHOLD can be shown to be PSHOLD; otherwise
+	 * reboot(2) keeps reporting failure rather than writing zero to an
+	 * unknown register. See sweet_restart.h.
+	 */
+	(void)sweet_restart_init();
 
 	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||

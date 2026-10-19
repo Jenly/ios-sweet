@@ -2,6 +2,57 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #13: reboot(2) actually works now (patch 0089) <<<
+
+**A functional hole, not a missing feature.** `PE_halt_restart` is assigned nowhere
+on ARM, so it stays NULL and `IOPlatformExpert::halt_restart()` returns -1 for
+every request (IOPlatformExpert.cpp:363-368). `reboot(2)` and the shutdown path
+therefore did **nothing at all** on this port -- the call reported failure and the
+phone kept running. On a device whose only other escape is holding the power
+button, that matters.
+
+Qualcomm resets by deasserting PS_HOLD; the bootloader then decides what happens
+next from a "restart reason" word in IMEM. Both halves are needed -- reset without
+a reason can be read as a crash, and a reason without the deassert does nothing.
+
+| item | value | source |
+|---|---|---|
+| PSHOLD | `0x010AC000` (4 bytes) | `msm8998.dtsi:586-590` |
+| deassert | `__raw_writel(0, msm_ps_hold)` | `msm-poweroff.c:381-396` |
+| IMEM base | `0x146BF000`, size `0x1000` | `msm8998.dtsi:3043-3046` |
+| restart reason | `+0x65c` -> `0x146BF65C` | `msm8998.dtsi:3060-3063` |
+| normal reason | `0x77665500` | `msm-poweroff.c:313` |
+
+**The safety rule is a pure function, on purpose.** Writing 0 to PS_HOLD powers the
+SoC off immediately, so taking over reboot is only justified when the register can
+be shown to be what we think it is. `sweet_restart_probe_ok()` lives in the header,
+both the driver and its test call that exact code, and the test needs **no stubs at
+all**:
+
+- reject `0` (gated block), `0xFFFFFFFF` (dead bus), and anything with bit 0 clear
+  (some other register)
+- accept anything with bit 0 set -- extra bits are allowed, because demanding
+  exactly 1 would reject a working board
+
+16 checks, including a two-way sweep of 1,000,000 values: no bit-0-clear value is
+accepted, every odd value is accepted, and all-ones is still refused. If the
+preflight fails, the hook is simply **not installed** and reboot keeps reporting
+failure -- strictly better than writing zero to an unknown register.
+
+**SM7150 is deliberately excluded.** Its PSHOLD address is not in this workspace's
+device trees, and the preflight cannot tell "asserted PSHOLD" from "some other
+register that happens to read odd". Guessing would be worse than the current
+honest no-op, so sweet logs that the address is unknown and leaves reboot alone.
+
+Nothing else is written: no PMIC access, no SCM call, no watchdog bite, no
+download-mode flags. Linux also disables the SDI and halts the SPMI arbiter before
+resetting; neither is needed for a reset to take effect here and both are writes
+that cannot be validated, so they are left out.
+
+Verified: 0001-0089 applies with 0 failures, 10/10 TUs compile, 618/618 undefined
+symbols resolve with 0 orphans, header-export clean, drift passes for all twelve
+created files, and all three host tests pass (MDP5 32 checks, USB 53, restart 16).
+
 ### >>> UPDATE 2026-10-20 #12: UEFI menu chainloads real EFI images <<<
 
 `sweet-uefi` no longer just explains why it cannot boot anything. Every `.efi`
