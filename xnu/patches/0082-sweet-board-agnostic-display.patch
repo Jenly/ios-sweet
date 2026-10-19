@@ -1353,6 +1353,20 @@ index 92f3e26..20561e5 100644
      "   },"
      "   {"
      "     'IOClass'         = SweetHIDButtons;"
+diff --git a/pexpert/pexpert/Makefile b/pexpert/pexpert/Makefile
+index e4a48d5..d5897fb 100644
+--- a/pexpert/pexpert/Makefile
++++ b/pexpert/pexpert/Makefile
+@@ -42,7 +42,8 @@ INSTALL_KF_MD_LCL_LIST = device_tree.h
+ INSTALL_MI_DIR = pexpert
+ 
+ EXPORT_MI_LIST	= ${DATAFILES} \
+-		    device_tree.h
++		    device_tree.h \
++		    SweetBoard.h
+ 
+ EXPORT_MI_DIR = pexpert
+ 
 diff --git a/pexpert/pexpert/SweetBoard.h b/pexpert/pexpert/SweetBoard.h
 new file mode 100644
 index 0000000..626385a
