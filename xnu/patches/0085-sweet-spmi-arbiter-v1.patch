@@ -1,14 +1,474 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -110,6 +110,7 @@
+@@ -110,6 +110,8 @@
  bsd/dev/sweet_touch.c			standard
  bsd/dev/chiron_touch.c			standard
  bsd/dev/msm8998_mdss.c			standard
 +bsd/dev/sweet_spmi_v1.c			standard
++bsd/dev/sweet_pm8998_reg.c			standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/chiron_touch.c b/bsd/dev/chiron_touch.c
+--- a/bsd/dev/chiron_touch.c
++++ b/bsd/dev/chiron_touch.c
+@@ -47,6 +47,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/SweetBoard.h>
+ #include "chiron_touch_proto.h"
++#include "sweet_pm8998_reg.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -825,6 +826,21 @@
+ 	}
+ 	printf("CHIRON TOUCH: panel %ux%u\n", ct.panel_w, ct.panel_h);
+ 
++	/*
++	 * Power first. chiron's touch vdd is pm8998_l6 and its analogue rail is
++	 * pm8998_l14 (chiron-msm8998-mtp.dtsi:214,217). Report both
++	 * unconditionally -- "L6 is off" is the most useful line a failed
++	 * bring-up can print -- and enable only when the regulator driver is
++	 * permitted to write (boot-arg sweetpmic=1).
++	 */
++	(void)sweet_pm8998_report("touch vdd", PM8998_LDO_L6);
++	(void)sweet_pm8998_report("touch avdd", PM8998_LDO_L14);
++	if (sweet_pm8998_enable("touch vdd", PM8998_LDO_L6) != 0) {
++		printf("CHIRON TOUCH: touch vdd (L6) is not enabled; "
++		    "the probe will probably fail\n");
++	}
++	(void)sweet_pm8998_enable("touch avdd", PM8998_LDO_L14);
++
+ 	ct.tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
+ 	ct.qup = ml_io_map(QUP5_PA, QUP5_SIZE);
+ 	ct.gcc = ml_io_map(GCC_PA, GCC_SIZE);
+diff --git a/bsd/dev/sweet_pm8998_reg.c b/bsd/dev/sweet_pm8998_reg.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_pm8998_reg.c
+@@ -0,0 +1,318 @@
++/*
++ * sweet_pm8998_reg.c -- PM8998 LDO control for chiron's touch rails.
++ *
++ * SAFETY MODEL. This is the first code in the port that WRITES to the PMIC, and
++ * that PMIC also feeds the CPU rails, so the constraints are deliberately severe:
++ *
++ *   1. OFF BY DEFAULT. Nothing here runs unless the boot-arg
++ *      `sweetpmic=1` is given. Without it every entry point returns
++ *      -1 immediately and the PMIC is never touched.
++ *
++ *   2. SET-ONLY. The only write is "enable". There is no disable path, no
++ *      voltage change, no mode change, no pull-down, no soft-start. A regulator
++ *      that is already on stays on with the voltage and mode the bootloader
++ *      chose, which is what the display and touch controller were brought up
++ *      against.
++ *
++ *   3. WHITELISTED RAILS. Only PM8998 L6 and L14 (chiron's touch vdd and
++ *      analogue rail, chiron-msm8998-mtp.dtsi:214,217) can be addressed. Rails
++ *      that feed the CPUs, DDR or the eMMC/UFS are not reachable by name, and
++ *      the range check rejects anything outside the two entries.
++ *
++ *   4. READ-BACK. After writing the enable bit the register is read again; a
++ *      rail that does not read back enabled is reported as a failure rather
++ *      than assumed to be up.
++ *
++ *   5. NO BLIND RETRY. If the write does not take, this reports and stops. It
++ *      never loops on the PMIC.
++ *
++ * What is deliberately NOT done: LAB/IBB (pmi8998), which drive the display
++ * backlight and need correct current-limit programming that cannot be validated
++ * from software yet. They are left exactly as the bootloader set them.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>		/* delay(), under XNU_KERNEL_PRIVATE */
++#include <pexpert/pexpert.h>
++
++#include "sweet_pm8998_reg.h"
++#include "sweet_spmi_v1.h"
++
++/*
++ * SPMI write, minimal and local to this file.
++ *
++ * The v1 arbiter command for a one-byte extended write is opcode 0
++ * (PMIC_ARB_OP_EXT_WRITEL, spmi-pmic-arb.c:76) with byte count 0 and the data in
++ * WDATA0 (PMIC_ARB_WDATA0 = +0x10, spmi-pmic-arb.c:41). Kept private rather than
++ * added to sweet_spmi_v1.c so that the general SPMI path stays read-only: a
++ * write can only happen through this whitelisted regulator entry point.
++ */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define SP_V1_CORE_PA   0x0800f000u
++#define SP_V1_CORE_SZ   0x00001000u
++#define SP_V1_OBS_PA    0x09400000u
++#define SP_V1_OBS_SZ    0x01000000u
++#define SP_V1_CFG_PA    0x0800a000u
++#define SP_V1_CFG_SZ    0x00003000u
++
++#define SP_CH_CMD       0x00u
++#define SP_CH_STATUS    0x08u
++#define SP_CH_WDATA0    0x10u
++#define SP_CH_RDATA0    0x18u
++
++#define SP_STATUS_DONE  0x1u
++#define SP_STATUS_ERRORS 0x0eu
++
++#define SP_OP_EXT_WRITEL 0u
++#define SP_OP_EXT_READL  1u
++
++#define SP_CHANNEL_MAP_OFF(n) (0x800u + 0x4u * (n))
++#define SP_OBS_OFF(ch)        (0x800u + 0x80u * (ch))
++#define SP_FMT_CMD_V1(opc, sid, addr, bc) \
++	(((opc) << 27) | (((sid) & 0xfu) << 20) | (((addr) & 0xffffu) << 4) | ((bc) & 0x7u))
++
++#define SP_NO_APID      0xffffu
++#define SP_MAX_APIDS    512u
++#define SP_PPID_MASK    0xfffu
++#define SP_POLL_LIMIT   1000u
++
++static vm_offset_t pm_core, pm_obs, pm_cfg;
++static unsigned    pm_apids;
++static bool        pm_mapped;
++static bool        pm_considered;
++static bool        pm_allowed;
++static int         pm_sleep_chan;
++
++static uint32_t
++pm_rd(vm_offset_t base, unsigned off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static uint16_t
++pm_find_apid(unsigned ppid)
++{
++	for (unsigned i = 0; i < pm_apids; i++) {
++		uint32_t map = pm_rd(pm_core, SP_CHANNEL_MAP_OFF(i));
++
++		if (map == 0 || ((map >> 8) & SP_PPID_MASK) != ppid) {
++			continue;
++		}
++		if ((pm_rd(pm_cfg, 0x700u + 4u * i) & 0x7u) == 0) {
++			return (uint16_t)i;
++		}
++	}
++	return SP_NO_APID;
++}
++
++/* One SPMI transaction. write != 0 stores `data`; otherwise reads into *data. */
++static int
++pm_xfer(unsigned sid, unsigned addr, uint8_t *data, int write)
++{
++	unsigned off, base;
++	uint16_t apid;
++	uint32_t cmd, status;
++
++	if (!pm_mapped || data == NULL) {
++		return -1;
++	}
++	apid = pm_find_apid(((sid & 0xfu) << 8) | ((addr >> 8) & 0xffu));
++	if (apid == SP_NO_APID) {
++		return -1;
++	}
++	base = SP_OBS_OFF(0);
++	off = base + 0x80u * apid;
++
++	__asm__ volatile("dmb oshst" ::: "memory");
++	if (write) {
++		*(volatile uint32_t *)(pm_obs + off + SP_CH_WDATA0) = *data;
++		__asm__ volatile("dmb oshst" ::: "memory");
++	}
++	cmd = SP_FMT_CMD_V1(write ? SP_OP_EXT_WRITEL : SP_OP_EXT_READL,
++	    sid, addr, 0);
++	*(volatile uint32_t *)(pm_obs + off + SP_CH_CMD) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++
++	for (unsigned i = 0; i < SP_POLL_LIMIT; i++) {
++		status = pm_rd(pm_obs, off + SP_CH_STATUS);
++		if (status & SP_STATUS_DONE) {
++			if (status & SP_STATUS_ERRORS) {
++				return -1;
++			}
++			if (!write) {
++				*data = (uint8_t)pm_rd(pm_obs, off + SP_CH_RDATA0);
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;      /* timed out; the caller must not retry blindly */
++}
++
++/*
++ * Gate. Everything below is inert unless sweetpmic=1 and the v1 arbiter is
++ * present. `pm_considered` makes the decision once per boot.
++ */
++static int
++pm_allowed_once(void)
++{
++	int want = 0;
++
++	if (pm_considered) {
++		return pm_allowed ? 0 : -1;
++	}
++	pm_considered = true;
++
++	if (!PE_parse_boot_argn("sweetpmic", &want, sizeof(want)) || want != 1) {
++		printf("SWEET PM8998: not enabled (boot-arg sweetpmic=1 required); "
++		    "regulators left exactly as the bootloader set them\n");
++		return -1;
++	}
++	if (sweet_spmi_v1_init() != 0) {
++		printf("SWEET PM8998: no v1 SPMI arbiter; cannot reach the PMIC\n");
++		return -1;
++	}
++
++	pm_core = ml_io_map(SP_V1_CORE_PA, SP_V1_CORE_SZ);
++	pm_obs  = ml_io_map(SP_V1_OBS_PA, SP_V1_OBS_SZ);
++	pm_cfg  = ml_io_map(SP_V1_CFG_PA, SP_V1_CFG_SZ);
++	if (pm_core == 0 || pm_obs == 0 || pm_cfg == 0) {
++		printf("SWEET PM8998: PMIC window mapping failed\n");
++		return -1;
++	}
++	pm_apids = SP_MAX_APIDS;
++
++	/*
++	 * Prove the PMIC answers before allowing any write: read the PM8998
++	 * revision register pair (PERPH 0x01, address 0x0100/0x0101 on SID 0).
++	 * A dead bus reads 0x00 or 0xff for both bytes.
++	 */
++	{
++		uint8_t rev0 = 0, rev1 = 0;
++
++		if (pm_xfer(PM8998_SID, 0x0100u, &rev0, 0) != 0 ||
++		    pm_xfer(PM8998_SID, 0x0101u, &rev1, 0) != 0 ||
++		    (rev0 == 0 && rev1 == 0) || (rev0 == 0xff && rev1 == 0xff)) {
++			printf("SWEET PM8998: PMIC does not answer at SID 0 "
++			    "(rev %#x %#x); refusing to write\n", rev0, rev1);
++			return -1;
++		}
++		printf("SWEET PM8998: PMIC revision %u.%u, writes permitted for "
++		    "L6/L14 only\n", rev1, rev0);
++	}
++
++	pm_mapped = true;
++	pm_allowed = true;
++	return 0;
++}
++
++static int
++pm_rail_ok(unsigned ldo)
++{
++	/* Only the two rails chiron's touch path uses. */
++	return ldo == PM8998_LDO_L6 || ldo == PM8998_LDO_L14;
++}
++
++int
++sweet_pm8998_read(unsigned ldo, unsigned reg, uint8_t *out)
++{
++	if (!pm_rail_ok(ldo) || reg > 0x7fu || out == NULL) {
++		return -1;
++	}
++	if (pm_allowed_once() != 0) {
++		return -1;
++	}
++	return pm_xfer(PM8998_SID, PM8998_LDO_BASE(ldo) + reg, out, 0);
++}
++
++int
++sweet_pm8998_report(const char *label, unsigned ldo)
++{
++	uint8_t en = 0, mode = 0, range = 0, set = 0;
++
++	if (!pm_rail_ok(ldo)) {
++		printf("SWEET PM8998: rail %u is not whitelisted\n", ldo);
++		return -1;
++	}
++	if (pm_allowed_once() != 0) {
++		return -1;
++	}
++	if (sweet_pm8998_read(ldo, PM8998_REG_ENABLE, &en) != 0 ||
++	    sweet_pm8998_read(ldo, PM8998_REG_MODE, &mode) != 0 ||
++	    sweet_pm8998_read(ldo, PM8998_REG_VOLTAGE_RANGE, &range) != 0 ||
++	    sweet_pm8998_read(ldo, PM8998_REG_VOLTAGE_SET, &set) != 0) {
++		printf("SWEET PM8998: %s (L%u) unreadable\n",
++		    label != NULL ? label : "?", ldo);
++		return -1;
++	}
++
++	printf("SWEET PM8998: %s (L%u) enable=%s mode=%s range=%u set=%u\n",
++	    label != NULL ? label : "?", ldo,
++	    (en & PM8998_ENABLE_BIT) ? "on" : "off",
++	    (mode & PM8998_MODE_HPM) ? "HPM" :
++	    ((mode & PM8998_MODE_AUTO) ? "AUTO" : "LPM"),
++	    range, set);
++
++	return (en & PM8998_ENABLE_BIT) ? 1 : 0;
++}
++
++int
++sweet_pm8998_enable(const char *label, unsigned ldo)
++{
++	uint8_t en = 0;
++
++	if (!pm_rail_ok(ldo)) {
++		printf("SWEET PM8998: refusing to touch rail %u (not whitelisted)\n",
++		    ldo);
++		return -1;
++	}
++	if (pm_allowed_once() != 0) {
++		return -1;
++	}
++	if (sweet_pm8998_read(ldo, PM8998_REG_ENABLE, &en) != 0) {
++		printf("SWEET PM8998: %s (L%u) enable register unreadable\n",
++		    label != NULL ? label : "?", ldo);
++		return -1;
++	}
++	if (en & PM8998_ENABLE_BIT) {
++		/*
++		 * Already on -- leave it alone. This is the expected case when a
++		 * bootloader powered the panel, and there is no reason to rewrite
++		 * a register that already says what we want.
++		 */
++		printf("SWEET PM8998: %s (L%u) already enabled (%#x); no write\n",
++		    label != NULL ? label : "?", ldo, en);
++		return 0;
++	}
++
++	/*
++	 * SET-ONLY: OR in the enable bit, keep every other bit as it is. Never
++	 * write 0x80 outright, because the low nibble carries the hardware
++	 * enable-follow bits (SPMI_COMMON_ENABLE_FOLLOW_*_MASK) which the
++	 * bootloader may have configured.
++	 */
++	{
++		uint8_t want = (uint8_t)(en | PM8998_ENABLE_BIT);
++
++		if (pm_xfer(PM8998_SID, PM8998_LDO_BASE(ldo) + PM8998_REG_ENABLE,
++		    &want, 1) != 0) {
++			printf("SWEET PM8998: %s (L%u) enable write failed; "
++			    "leaving the rail as it was\n",
++			    label != NULL ? label : "?", ldo);
++			return -1;
++		}
++	}
++
++	/* Read back rather than assume. */
++	if (sweet_pm8998_read(ldo, PM8998_REG_ENABLE, &en) != 0 ||
++	    !(en & PM8998_ENABLE_BIT)) {
++		printf("SWEET PM8998: %s (L%u) did not read back enabled (%#x)\n",
++		    label != NULL ? label : "?", ldo, en);
++		return -1;
++	}
++	printf("SWEET PM8998: %s (L%u) enabled (now %#x)\n",
++	    label != NULL ? label : "?", ldo, en);
++	return 0;
++}
+diff --git a/bsd/dev/sweet_pm8998_reg.h b/bsd/dev/sweet_pm8998_reg.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_pm8998_reg.h
+@@ -0,0 +1,98 @@
++/*
++ * sweet_pm8998_reg.h -- PM8998 regulator control over the v1 SPMI arbiter.
++ *
++ * Why this exists: chiron's touch controller is powered from pm8998_l6 and its
++ * analogue rail from pm8998_l14 (xiaomi/chiron-msm8998-mtp.dtsi:214,217):
++ *
++ *     vdd-supply  = <&pm8998_l6>;      synaptics,pwr-reg-name = "vdd";
++ *     disp-supply = <&pm8998_l14>;     synaptics,bus-reg-name = "avdd";
++ *
++ * On the Android side the PMIC leaves those rails up. Whether a bootloader
++ * handoff keeps them up is unknown, so the touch driver needs to be able to turn
++ * them on itself. Today chiron_touch.c only notes the supplies in a comment.
++ *
++ * REGISTER MAP -- from qcom_spmi-regulator.c in this workspace, which is the
++ * authority rather than a datasheet guess:
++ *
++ *   module bases (spmi_regulator_data tables, qcom_spmi-regulator.c:1441-1510)
++ *       l1  0x4000    l2  0x4100   ...   l6  0x4500   ...   l14 0x4d00
++ *       i.e. 0x4000 + 0x100 * (n - 1)
++ *
++ *   control registers, common to every QPNP regulator
++ *   (qcom_spmi-regulator.c:159-166, "these are offsets from 0x40"):
++ *       +0x40 VOLTAGE_RANGE
++ *       +0x41 VOLTAGE_SET
++ *       +0x45 MODE
++ *       +0x46 ENABLE          <- SPMI_COMMON_REG_ENABLE
++ *
++ *   enable bits (qcom_spmi-regulator.c:193-195)
++ *       ENABLE_MASK 0x80   ENABLE 0x80   DISABLE 0x00
++ *
++ *   mode bits (qcom_spmi-regulator.c:203-206)
++ *       HPM 0x80 (high power mode)   AUTO 0x40   BYPASS 0x20
++ *
++ *   the driver's own enable path is
++ *       spmi_regulator_common_enable -> update_bits(REG_ENABLE, 0x80, 0x80)
++ *   (qcom_spmi-regulator.c:505-511) so writing 0x80 into +0x46 is exactly what
++ *   Linux does.
++ *
++ * SID: pm8998 sits at SPMI slave 0 (msm-pm8998.dtsi:18, "qcom,pm8998@0").
++ *
++ * PUMP/IBB (lab-supply, ibb-supply) are PMI8998 LAB/IBB regulators with their
++ * own module types and current-limit programming. They are NOT touched here:
++ * they drive the display backlight, not the touch panel, and getting their
++ * current limits wrong is a hardware risk with no way to validate it from
++ * software yet.
++ */
++
++#ifndef SWEET_PM8998_REG_H
++#define SWEET_PM8998_REG_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* PM8998 LDO module bases, qcom_spmi-regulator.c:1446-1466 */
++#define PM8998_LDO_BASE(n)     (0x4000u + 0x100u * ((n) - 1u))
++
++#define PM8998_LDO_L6          6u
++#define PM8998_LDO_L14         14u
++
++/* Common control register offsets from the module base */
++#define PM8998_REG_VOLTAGE_RANGE  0x40u
++#define PM8998_REG_VOLTAGE_SET    0x41u
++#define PM8998_REG_MODE           0x45u
++#define PM8998_REG_ENABLE         0x46u
++
++#define PM8998_ENABLE_BIT         0x80u
++#define PM8998_MODE_HPM           0x80u
++#define PM8998_MODE_AUTO          0x40u
++
++#define PM8998_SID                0u
++
++/*
++ * Read one regulator control register. 0 on success.
++ * Needs sweet_spmi_v1_init() to have succeeded.
++ */
++int sweet_pm8998_read(unsigned ldo, unsigned reg, uint8_t *out);
++
++/*
++ * Report what an LDO currently looks like: enable state, mode, voltage selector.
++ * Logs one line; never writes. Returns 1 if enabled, 0 if not, -1 on error.
++ */
++int sweet_pm8998_report(const char *label, unsigned ldo);
++
++/*
++ * Ensure an LDO is enabled. If it already is, this is a no-op and says so --
++ * the common case when a bootloader already brought the panel up.
++ * Returns 0 if the rail ends up enabled, negative otherwise.
++ */
++int sweet_pm8998_enable(const char *label, unsigned ldo);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* SWEET_PM8998_REG_H */
 diff --git a/bsd/dev/sweet_spmi_v1.c b/bsd/dev/sweet_spmi_v1.c
 new file mode 100644
 --- /dev/null

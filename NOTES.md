@@ -2,6 +2,49 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #7: PM8998 regulator control (still patch 0085) <<<
+
+chiron's touch controller is powered from `pm8998_l6` (vdd) and `pm8998_l14`
+(avdd) -- `chiron-msm8998-mtp.dtsi:214,217`. Until now `chiron_touch.c` only
+mentioned those supplies in a comment, so if a bootloader handoff dropped them
+the probe would fail with no explanation.
+
+`bsd/dev/sweet_pm8998_reg.{c,h}` adds report + enable, and `chiron_touch.c` now
+reports both rails before its first bus access and enables them when permitted.
+
+**This is the first code in the port that WRITES to the PMIC, and that PMIC also
+feeds the CPU rails, so the constraints are deliberately severe:**
+
+| constraint | why |
+|---|---|
+| off unless `sweetpmic=1` | default boot touches nothing |
+| set-only, never clear | a rail the bootloader raised keeps its voltage and mode, which is what the panel was brought up against |
+| whitelist L6/L14 | CPU/DDR/storage rails are not addressable by name, and a range check rejects anything else |
+| read-back after write | a rail that does not read back enabled is reported as a failure, not assumed up |
+| no blind retry | a failed write reports and stops; it never loops on the PMIC |
+| bus proof first | reads the PM8998 revision pair and refuses to write if the bus looks dead |
+
+LAB/IBB (pmi8998) are deliberately untouched: they drive the display backlight
+and need correct current-limit programming that cannot be validated from
+software yet.
+
+Register map is from `qcom_spmi-regulator.c` in this workspace, not a datasheet
+guess: LDO base `0x4000 + 0x100*(n-1)`, control registers at `+0x40` range,
+`+0x41` set, `+0x45` mode, `+0x46` enable; enable bit `0x80`; the driver's own
+path is `update_bits(REG_ENABLE, 0x80, 0x80)`.
+
+**Tooling fix that this forced.** `tools/test-chiron-touch.sh` reconstructed a
+file from a single patch's `+` lines, which stops being correct the moment a
+second patch touches the same file -- exactly what 0085 now does to
+`chiron_touch.c`. New `tools/reconstruct_file.py` replays the whole series in
+order, so the drift check still means "the repo source equals what the patches
+produce" but no longer assumes one patch per file. It now covers all eight
+files the series creates.
+
+Verified: 0001-0085 applies with 0 failures, 10/10 TUs compile, 617/617
+undefined symbols resolve with 0 orphans, header-export clean, drift check
+passes for all eight files. Not run on hardware.
+
 ### >>> UPDATE 2026-10-20 #6: PMIC arbiter v1 port (0085) <<<
 
 **A real cross-SoC incompatibility, found by auditing rather than by a crash.**

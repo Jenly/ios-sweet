@@ -192,21 +192,23 @@ gcc -std=gnu99 -O2 -Wall -Wextra -Werror -Ibsd/dev -I"$OUT" \
 # ---------------------------------------------------------------------------
 echo
 echo "patch/src drift check"
-for pair in "bsd/dev/chiron_touch.c:xnu/patches/0082-sweet-board-agnostic-display.patch" \
-            "bsd/dev/chiron_touch_proto.h:xnu/patches/0082-sweet-board-agnostic-display.patch"; do
-	src=${pair%%:*}; patch=${pair##*:}
+for src in bsd/dev/chiron_touch.c bsd/dev/chiron_touch_proto.h \
+           bsd/dev/sweet_spmi_v1.c bsd/dev/sweet_spmi_v1.h \
+           bsd/dev/sweet_pm8998_reg.c bsd/dev/sweet_pm8998_reg.h \
+           bsd/dev/msm8998_mdss.c bsd/dev/msm8998_mdss.h; do
 	[ -f "$src" ] || { echo "  $src missing" >&2; exit 1; }
-	# reconstruct the file the patch installs (all '+' lines of its hunk)
-	awk -v want="$src" '
-		$0 ~ "^diff --git a/" want " " {on=1; next}
-		on && /^diff --git / {on=0}
-		on && /^@@/ {body=1; next}
-		on && body && /^\+/ {print substr($0,2)}
-	' "$patch" > "$OUT/from-patch.c"
+	# Rebuild the file the way the whole series does, not from one patch:
+	# a file created by 0082 and modified by 0085 has to match the pair.
+	if ! python3 "$(dirname "$0")/reconstruct_file.py" "$src" xnu/patches \
+	    > "$OUT/from-patch.c" 2>"$OUT/err"; then
+		echo "  $src: reconstruct failed" >&2
+		cat "$OUT/err" >&2
+		exit 1
+	fi
 	if diff -q "$src" "$OUT/from-patch.c" >/dev/null 2>&1; then
-		echo "  $src matches the patch"
+		echo "  $src matches the patch series"
 	else
-		echo "  MISMATCH: $src differs from what the patch installs" >&2
+		echo "  MISMATCH: $src differs from what the patches install" >&2
 		diff "$src" "$OUT/from-patch.c" | head -20 >&2
 		exit 1
 	fi

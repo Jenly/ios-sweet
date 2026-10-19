@@ -47,6 +47,7 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/SweetBoard.h>
 #include "chiron_touch_proto.h"
+#include "sweet_pm8998_reg.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
@@ -824,6 +825,21 @@ chiron_touch_thread(void *arg, wait_result_t result)
 		ct.panel_h = h ? h : 2160;
 	}
 	printf("CHIRON TOUCH: panel %ux%u\n", ct.panel_w, ct.panel_h);
+
+	/*
+	 * Power first. chiron's touch vdd is pm8998_l6 and its analogue rail is
+	 * pm8998_l14 (chiron-msm8998-mtp.dtsi:214,217). Report both
+	 * unconditionally -- "L6 is off" is the most useful line a failed
+	 * bring-up can print -- and enable only when the regulator driver is
+	 * permitted to write (boot-arg sweetpmic=1).
+	 */
+	(void)sweet_pm8998_report("touch vdd", PM8998_LDO_L6);
+	(void)sweet_pm8998_report("touch avdd", PM8998_LDO_L14);
+	if (sweet_pm8998_enable("touch vdd", PM8998_LDO_L6) != 0) {
+		printf("CHIRON TOUCH: touch vdd (L6) is not enabled; "
+		    "the probe will probably fail\n");
+	}
+	(void)sweet_pm8998_enable("touch avdd", PM8998_LDO_L14);
 
 	ct.tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
 	ct.qup = ml_io_map(QUP5_PA, QUP5_SIZE);
