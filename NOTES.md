@@ -2,6 +2,67 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #5: GPU blit MERGED and building; UEFI app shipped <<<
+
+**1. MDP5 hardware blit is in the kernel and CI-green.**
+
+CI run `39297800928` on `sbccc1888/ios-sweet` branch `chiron-support`,
+commit `e48a604`: **success**, 8 min. Kernel artifact:
+17,239,872 bytes, `Mach-O 64-bit arm64 executable, flags:<NOUNDEFS|PIE>`,
+SHA256 `9ff6c286eb54251412ae9da373b7ed1b8a6151f807e5695f51aa176e42a83efa`
+(matches the artifact's own `SHA256SUMS`).
+
+Verified in the binary rather than assumed from a green tick:
+
+```
+_sweet_mdss_init            fffffe00074ed59c
+_sweet_mdss_blit            fffffe00074ed6e8
+_sweet_mdss_wait_idle       fffffe00074ed6fc
+_sweet_mdss_dstc_candidate  fffffe00074ed574
+_sweet_mdss_disable         fffffe00074ed7e0
+_sweet_mdss_stats           fffffe00074ed854
+_chiron_touch_init          fffffe00074eb638
+_sweet_secondary_entry      fffffe000748d000
+```
+
+plus every `SWEET MDSS:` and `SWEET FB: MDP5` log string.
+
+Patch `0084-sweet-mdss-mdp5-blit.patch` (4 files, 747 lines) adds
+`bsd/dev/msm8998_mdss.{c,h}`, the `bsd/conf/files` entry, and the call sites in
+`AppleCLCD::present()` plus `AppleCLCD::mdssVerify()`. Gated by `sweetmdss`:
+absent/0 touches nothing, 1 only reads MDP_HW_VERSION, 2 enables the blit and
+verifies it against a CPU-drawn scanline before trusting it. Full design notes
+are in the `UPDATE #4` block below.
+
+**2. New repo: https://github.com/sbccc1888/sweet-uefi**
+
+A graphical UEFI boot menu, its own repository as requested. CI run
+`39297726977`: **success**. Builds to a 193 KB PE32+ AArch64 EFI application
+with clang + lld-link only -- no edk2, no gnu-efi.
+
+The interesting part is how the UI was verified. `tools/preview.py` compiles the
+same `gfx.c`/`ui.c`/`font.c` for the host and renders a frame to PNG;
+`tools/check_layout.py` measures the highlight pill and the text inside it and
+fails the build if the text does not fit. That loop immediately paid for itself:
+
+- First render had **every space missing** -- "Bootoptions",
+  "XiaomiMiMIX2-chiron". The font baker recorded advance 0 for ink-less glyphs
+  (space has no pixels, but it does have a width).
+- Second pass: the selected row's detail line hung outside the pill. Fixed by
+  measuring the two-line block and centring it, then by correcting
+  `gfx_text()`'s contract: its `y` is the **line box top**, not a baseline, so
+  adding ascent at the call sites double-counted it.
+- `check_layout.py` itself had a sign error first (reported overflow while the
+  text was inside). Corrected to `inset = text_top - pill_top`, and it now
+  asserts a minimum inset.
+
+Neither bug was visible from the code, the compiler, or the linked binary.
+
+The UEFI app does **not** do the kernel handoff: it finds and validates the
+`SWEETXNU` payload and reports what it found. The segment copy and MMU
+transition stay in `shim/loader.c`, which already does that job. It has not been
+booted on hardware.
+
 ### >>> UPDATE 2026-10-20 #4: MDP5 hardware blit (patch 0084) <<<
 
 **GPU improvement wired in, behind a boot-arg, with a self-verifying safe mode.**
