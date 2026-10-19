@@ -197,7 +197,7 @@ What is already done and checked (no hardware access needed):
 What is still missing, in the order it will be needed on hardware:
 
 1. **Boot path.** MSM8998 boots through [edk2-msm8998](https://github.com/edk2-porting/edk2-msm8998) (UEFI), not through a fastboot `boot` image with a stock ABL. Either load the shim from UEFI as an EFI application (`shim/` linked at a UEFI-safe address, or a small EFI wrapper that reads the payload and jumps), or use the `fastboot boot` path with the UEFI-provided DTB — the shim itself only needs a DTB in `x0` and the payload in the ramdisk.
-2. **Framebuffer address.** EDK2's `SimpleFbDxe` drives `0x9d400000`; the shim currently uses the Linux splash region `0x9d600000` (`fb.base`). The UEFI path should pass the real surface (GOP `FrameBufferBase`) to the shim; both addresses are in `tools/devices.py`.
+2. **Framebuffer address.** The shim defaults to the address the SoC's bootloader leaves the splash at — for chiron `0x9d400000`, which is also what EDK2's `SimpleFbDxe` drives (`PcdMipiFrameBufferAddress`) and what the edk2 chiron DTB calls `splash_region` (Linux's `cont_splash_mem` is 2 MiB later, `0x9d600000`). A UEFI wrapper that knows the real GOP surface can override it at runtime with `/chosen/ios-sweet,fb-base`, `-width`, `-height`, `-stride`; the shim logs what it picked (`FB base/w/h`).
 3. **Console.** `ADT /arm-io/wdt` has `no-pmu`, so watchdogd stays happy. The kernel console draws to the panel memory the shim reports, which is how panics will be read.
 4. **Storage.** The UFS host is at `0x1da4000` (`qcom,ufshc`, same UFSHCI register layout), hardwired to the UFSHCI register block the bootloader leaves running. What is missing is the MSM8998 GCC/PHY state: if the host is not left enabled by UEFI, the `sweet_ufs.c` driver needs the MSM8998 clock and PHY registers.
 5. **Touch and buttons.** No driver yet: the Mi MIX 2 uses a Synaptics DSX (I²C `0x20`, IRQ GPIO 125, reset GPIO 89) and the PM8998 PON for the power/volume keys. The existing drivers are SM7150-specific and switch themselves off on chiron, so the phone will boot without input.
@@ -276,7 +276,7 @@ chiron (Mi MIX 2, MSM8998) — from the device tree that edk2-porting/edk2-msm89
 - Timer: the usual ARM PPI numbering, virtual timer INTID 27 (sweet: 19).
 - Cores: 4× Kryo 280 Gold (MPIDR `0x000`–`0x003`) + 4× Silver (`0x100`–`0x103`); the big cluster comes first in the device tree, which is why `cpus=4` selects it.
 - UFS host at `0x1da4000` (sweet: `0x1d84000`), `qcom,pshold` at `0x10ac000`, IMEM restart reason at `0x146bf65c`.
-- Panel: 1080×2160 (panel node `0x438`×`0x870`); EDK2's `SimpleFbDxe` drives `0x9d400000`, the Linux/ABL continuous-splash region is `0x9d600000`. Presenting the iPhone X screen (1125×2436) on it crops 22 px left/right and the bottom 276 rows, top-aligned so the status bar stays visible.
+- Panel: 1080×2160 (panel node `0x438`×`0x870`); the edk2 chiron DTB's `splash_region` and EDK2's `SimpleFbDxe` both use `0x9d400000` (Linux's `cont_splash_mem` is `0x9d600000`). Presenting the iPhone X screen (1125×2436) on it crops 22 px left/right and the bottom 276 rows, top-aligned so the status bar stays visible.
 - Touch: Synaptics DSX (S3330 / TD4322) on i2c `@0x20`, IRQ GPIO 125, reset GPIO 89 — **no driver yet**, so touch stays off.
 
 More in [`NOTES.md`](NOTES.md).

@@ -73,11 +73,12 @@
 
 **Not done / next (chiron):** kernel CI run with 0082 (the patch is only
 apply-checked, never compiled by a macOS runner yet); a UEFI boot path for
-MSM8998 (edk2-msm8998 loads the shim, and it must pass the GOP framebuffer
-address rather than the `0x9d600000` splash region); MSM8998 UFS clock/PHY
-state if UEFI does not leave the host enabled; Synaptics DSX touch driver and
-PM8998 PON keys. sweet is unaffected: same ADT semantics, same boot-args,
-same kernel behaviour apart from the values now coming from the ADT.
+MSM8998 (edk2-msm8998 loads the shim, which then needs the GOP framebuffer —
+the shim now defaults to `0x9d400000`, exactly the edk2 `splash_region`, and
+accepts `/chosen/ios-sweet,fb-*` overrides, see `shim/loader.c`); MSM8998 UFS
+clock/PHY state if UEFI does not leave the host enabled; Synaptics DSX touch
+driver and PM8998 PON keys. sweet is unaffected: same ADT semantics, same
+boot-args, same kernel behaviour apart from the values now coming from the ADT.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 

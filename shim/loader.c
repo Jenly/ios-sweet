@@ -115,6 +115,24 @@ const char *loader_boot(uintptr_t dtb)
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 
+	/*
+	 * Panel memory. The built-in default is the address this SoC's bootloader
+	 * leaves the continuous splash at (devcfg.h). A bootloader that knows
+	 * better -- the UEFI path on MSM8998, where GOP owns the surface -- puts
+	 * the real values in /chosen and they win.
+	 */
+	uint64_t fb_base = FB_BASE, fb_w = FB_W, fb_h = FB_H, fb_stride = FB_STRIDE;
+	fdt_chosen_u64(dtb, "ios-sweet,fb-base", &fb_base);
+	fdt_chosen_u64(dtb, "ios-sweet,fb-width", &fb_w);
+	fdt_chosen_u64(dtb, "ios-sweet,fb-height", &fb_h);
+	fdt_chosen_u64(dtb, "ios-sweet,fb-stride", &fb_stride);
+	if (fb_stride < fb_w * 4) {
+		fb_stride = fb_w * 4;
+	}
+	con_hex2("FB", "base=", (uint32_t)fb_base, "hi=", (uint32_t)(fb_base >> 32));
+	con_hex2("FB", "w=", (uint32_t)fb_w, "h=", (uint32_t)fb_h);
+	con_hex("FB stride", fb_stride);
+
 	zero64(ba_pa, PAGE_16K);
 	volatile struct boot_args *ba = (volatile struct boot_args *)ba_pa;
 	ba->Revision = 2;
@@ -123,11 +141,11 @@ const char *loader_boot(uintptr_t dtb)
 	ba->physBase = p->phys_base;
 	ba->memSize = p->mem_size;
 	ba->topOfKernelData = top;
-	ba->Video.v_baseAddr = FB_BASE;
+	ba->Video.v_baseAddr = fb_base;
 	ba->Video.v_display = 1;
-	ba->Video.v_rowBytes = FB_STRIDE;
-	ba->Video.v_width = FB_W;
-	ba->Video.v_height = FB_H;
+	ba->Video.v_rowBytes = (uint32_t)fb_stride;
+	ba->Video.v_width = (uint32_t)fb_w;
+	ba->Video.v_height = (uint32_t)fb_h;
 	ba->Video.v_depth = 32;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;

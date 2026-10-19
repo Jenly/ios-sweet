@@ -128,10 +128,13 @@ DEVICES = {
         # imem@146bf000 { restart_reason@65c }
         pshold=0x010ac000,
         imem_restart=0x146bf65c,
-        # EDK2 drives the panel at 0x9d400000 (PcdMipiFrameBufferAddress);
-        # the Linux/ABL continuous splash region is 0x9d600000 (36 MiB).
+        # Framebuffer: the edk2 chiron DTB (the FDT that UEFI passes on real
+        # hardware) has splash_region@0x9d400000 + 36 MiB, and edk2's
+        # SimpleFbDxe drives exactly that (PcdMipiFrameBufferAddress). Linux's
+        # cont_splash_mem is 2 MiB later at 0x9d600000; the shim prefers
+        # /chosen/ios-sweet,fb-* overrides if a bootloader disagrees.
         # 1080x2160 from chiron.dsc and the panel node (0x438 x 0x870).
-        fb=dict(base=0x9d600000, base_uefi=0x9d400000, size=0x2400000,
+        fb=dict(base=0x9d400000, base_linux=0x9d600000, size=0x2400000,
                 width=1080, height=2160, stride=1080 * 4,
                 splash="splash_region"),
         # Same logical iPhone X screen, but the panel is 276 px shorter, so
