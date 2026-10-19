@@ -2,6 +2,28 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #15: the new CI gate fired, on itself <<<
+
+Run `39316766833` failed at step 4 and skipped the build. That is the gate working
+-- but what it caught was an **environment gap, not a code bug**: `shim FDT` needs
+`dtc`, and the macOS runner does not ship it.
+
+Two separate fixes, because they are two separate problems:
+
+1. **`tools/test.sh` treated "cannot run" as "failed".** A test whose tool is absent
+   has said nothing about the code, so it is now a skip that prints its reason
+   ("dtc not installed", "no host C compiler") and the summary counts skips
+   separately, with a line saying that skipped checks prove nothing either way.
+   Visible, never silent.
+2. **The workflow installs dtc** (`brew install ... dtc`), so the skip does not
+   happen at all. Otherwise that check disappears from CI, which is how checks rot.
+
+Worth recording for the next person reading a failed run: the later failures in
+that log -- "Package build tree for local compiles" and an artifact upload
+complaining about an asterisk in `/kdk-libs/lib*.members.txt` -- are **cascade from
+Build being skipped**, not separate bugs. The upload step's glob is only reached
+because the real file list was never produced.
+
 ### >>> UPDATE 2026-10-20 #14: the host tests now gate CI <<<
 
 **Every check written this session ran only when someone typed its name.** The
