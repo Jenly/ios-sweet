@@ -182,6 +182,7 @@ struct rmi_fn_desc {
 
 #define TOUCH_MAX          RMI_MAX_FINGERS
 #define POLL_MS            10u
+#define CT_MAX_WRITE       64u       /* longest single I2C write we issue */
 
 /* ---------------------------------------------------------------- state */
 
@@ -205,9 +206,6 @@ struct chiron_touch_state {
 
 static struct chiron_touch_state ct;
 
-/* Scratch for the FIFO words of one write: (64 bytes + 1 address + 1) / 2. */
-static uint32_t ct_write_scratch[40];
-
 /* ---------------------------------------------------------------- helpers */
 
 static uint32_t
@@ -222,15 +220,23 @@ ct_wr(vm_offset_t base, uint32_t off, uint32_t val)
 	*(volatile uint32_t *)(base + off) = val;
 }
 
+/* Sleep channel for this driver's waits (the pattern bsd/dev/sweet_touch.c uses). */
+static int ct_sleep_chan;
+
+/*
+ * Sleep without busy-waiting: the startup delay is tens of seconds, and the
+ * QUP polls can add up, so spin-waiting here would burn a CPU for the whole
+ * boot. IOSleep() is an IOKit function and not available to a BSD driver;
+ * clock_interval_to_deadline + thread_block is what sweet_touch.c does.
+ */
 static void
 ct_wait_ms(unsigned ms)
 {
-	uint64_t end = 0;
-	nanoseconds_to_absolutetime((uint64_t)ms * 1000000ull, &end);
-	end += mach_absolute_time();
-	while (mach_absolute_time() < end) {
-		IOSleep(1);
-	}
+	uint64_t deadline;
+
+	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+	(void)assert_wait_deadline(&ct_sleep_chan, THREAD_UNINT, deadline);
+	thread_block(THREAD_CONTINUE_NULL);
 }
 
 /* ------------------------------------------------------------- QUP v2 I2C */
@@ -290,7 +296,7 @@ qup_set_bus_clock(vm_offset_t qup, uint32_t bus_hz)
 static int
 qup_write(vm_offset_t qup, uint8_t addr, const uint8_t *buf, unsigned len)
 {
-	uint32_t words[(sizeof(ct_write_scratch) / 4)];
+	uint32_t words[CT_MAX_WRITE / 2 + 2];
 	unsigned nwords;
 	int rc;
 
@@ -339,10 +345,10 @@ qup_read(vm_offset_t qup, uint8_t addr, uint8_t *buf, unsigned len)
 {
 	int rc;
 
-	if (len == 0 || len > 64) {
+	if (len == 0 || len > CT_MAX_WRITE) {
 		return EINVAL;
 	}
-	/* FIFO mode, "0 length means 256" does not matter at <= 64 bytes */
+	/* FIFO mode; "0 length means 256" never applies at <= CT_MAX_WRITE */
 	ct_wr(qup, QUP_IO_MODE, QUP_IO_REPACK);
 	ct_wr(qup, QUP_MX_READ_CNT, len);
 

@@ -2,6 +2,80 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-19 late #3: kernel-API audit of the new code (pre-CI) <<<
+
+CI cannot be run from this server (no `gh`, no GitHub credentials), so the
+substitute was the next most useful thing: check every kernel API the new code
+calls against the **real headers in the patched tree**, and fix what was wrong.
+This found one defect that would have failed the macOS build.
+
+**Defect fixed — `IOSleep()` is not available to a BSD driver.**
+`bsd/dev/chiron_touch.c` used `IOSleep(1)` in a busy-wait. `IOSleep` is
+declared only in `iokit/IOKit/IOLib.h` (`IOLib.h:575`), which a `bsd/` driver
+does not include; including IOKit into BSD C is the wrong dependency. Replaced
+with the sleep-channel pattern `bsd/dev/sweet_touch.c:102-108` already uses on
+hardware:
+
+```c
+static int ct_sleep_chan;
+clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+(void)assert_wait_deadline(&ct_sleep_chan, THREAD_UNINT, deadline);
+thread_block(THREAD_CONTINUE_NULL);
+```
+
+This also removes a 45-second busy-wait at boot, which would have burned a CPU
+core and could have starved the boot.
+
+**APIs verified present and correctly shaped** (each checked in the tree, not
+assumed):
+
+| call | declaration found |
+| --- | --- |
+| `kernel_thread_start` | `osfmk/kern/thread.h:1793` |
+| `thread_block` / `THREAD_CONTINUE_NULL` | `sched_prim.h:741`, `kern_types.h:95` |
+| `assert_wait_deadline` | `sched_prim.h:769` |
+| `clock_interval_to_deadline` | `kern/clock.h:217` |
+| `NSEC_PER_MSEC` | `mach/clock_types.h:87` |
+| `THREAD_UNINT` | `kern_types.h:179` |
+| `delay(int usec)` | `kern/clock.h:337` |
+| `PE_parse_boot_argn` | `pexpert.h:337` |
+| `ml_io_map` | declared by the drivers themselves (as sweet_touch.c does) |
+| `thread_terminate` | **not** in BSD-visible `thread.h`; declared by the driver, same as `sweet_touch.c:20` |
+
+`vm_offset_t`/`vm_size_t`/`wait_result_t` come from `mach/*/vm_types.h` and
+`kern_types.h:86`; all already pulled in by `sys/param.h` + `kern/thread.h`.
+
+**SweetCPU (patch 0083) C++ checked against the shared-pointer migration.**
+This XNU returns `OSPtr<OSString>` from `OSString::withCString()` and
+`OSPtr<const OSSymbol>` from `OSSymbol::withCString()` (`OSString.h:176`,
+`OSSymbol.h:297`), so an assignment to a raw pointer could have failed. It is
+safe, and not by luck: `SweetBattery.cpp:82,94` and `SweetCPU.cpp` already do
+`const OSSymbol *symbol = OSSymbol::withCString(key);`, and
+`iokit/bsddev/DINetBootHook.cpp:240` does exactly the construct 0083 adds,
+`OSDynamicCast(OSString, controller->getProperty(...))`. `OSString.h` is
+included and `OSSymbol` derives from `OSString` (`OSSymbol.h:88`), so
+`getCStringNoCopy()` is visible.
+
+**How this was verified without macOS:** the driver was compiled for arm64 with
+`-Wall -Wextra -Werror` against stub headers whose **signatures were copied
+from the real ones** (not invented), so a mismatch is a compile error rather
+than a CI surprise. 7.2 KiB text, no warnings. Two stub-only gaps surfaced
+along the way (`event_t`, `wait_interrupt_t`, and the
+`kernel_ptr_semantics` attribute GCC does not have) — those are artefacts of
+the harness, not of the driver.
+
+**Also hardened while in there:** the driver no longer keeps a global scratch
+buffer for FIFO words (`ct_write_scratch` was declared but the function used a
+stack array sized from it, which is fragile); it is a plain stack array sized
+by `CT_MAX_WRITE`, and both `qup_write`/`qup_read` share that one constant
+instead of a literal 64.
+
+**State:** `xnu/patches/0082` regenerated (1555 lines) and carries the fixed
+sources; `tools/test-chiron-touch.sh` re-run and its source-vs-patch drift
+check passes, so the tested code is the shipped code. `0001-0083` applies to a
+clean xnu-8796.141.3 with 0 failures. **Still never compiled by a macOS
+runner and never run on hardware.**
+
 ### >>> UPDATE 2026-10-19 late #2: chiron touch driver + GPU feasibility study <<<
 
 **A) Touch driver for chiron: `bsd/dev/chiron_touch.c` (+ `chiron_touch_proto.h`).**
