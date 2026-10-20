@@ -10,7 +10,7 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 + * constant it replaces was sweet's 0x9c000000, which on chiron is 20 MiB from the real
 + * region.
 + */
-+static paddr_t sweet_fb_pa = 0x9c000000ULL;
++static pmap_paddr_t sweet_fb_pa = 0x9c000000ULL;
 +
  static void
  sweet_early_map_final(void)
@@ -38,7 +38,7 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 +	 */
 +	if (args->Video.v_baseAddr != 0 && args->Video.v_width != 0 &&
 +	    args->Video.v_height != 0 && args->Video.v_rowBytes >= 4) {
-+		sweet_fb_pa = (paddr_t)args->Video.v_baseAddr;
++		sweet_fb_pa = (pmap_paddr_t)args->Video.v_baseAddr;
 +		sweet_early_set_fb(args->Video.v_baseAddr,
 +		    (uint32_t)args->Video.v_width,
 +		    (uint32_t)args->Video.v_height,
