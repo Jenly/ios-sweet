@@ -121,13 +121,19 @@ fi
 # A built chiron boot.img, when one is present. This is the only check that looks
 # at the actual flashable artifact: kernel, payload-as-ramdisk and device tree all in
 # one file, with the header fields that decide whether fastboot accepts it.
+# The v0 image is the one that boots: chiron's ABL rejects v1/v2 with
+# "BootImage is Incomplete". Ask for it by name first, so a leftover artifact in
+# another format cannot shadow it -- which is exactly what happened once.
 CHIRON_IMG=
-for cand in out-chiron/shim-boot-chiron.img shim/out/shim-boot-chiron.img; do
+for cand in out-chiron/boot-chiron-v0.img out-chiron/boot-v0-full.img \
+            out-chiron/boot-chiron.img shim/out/shim-boot-chiron.img; do
 	if [ -f "$cand" ]; then CHIRON_IMG=$cand; break; fi
 done
 if [ -n "$CHIRON_IMG" ]; then
-	run "chiron boot image" python3 tools/test-bootimg.py "$CHIRON_IMG" \
-	    --expect-dtb-addr 0x1f00000
+	# No --expect-dtb-addr: the image that boots chiron is header v0, which has no
+	# dtb field at all (the tree is appended to the kernel). Pinning a v2 address
+	# here is what made this check fail on a good image.
+	run "chiron boot image" python3 tools/test-bootimg.py "$CHIRON_IMG"
 else
 	skip "chiron boot image" "not built (tools/build-chiron.sh KERNEL)"
 fi
