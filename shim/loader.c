@@ -43,12 +43,19 @@ struct boot_args {
 	uint32_t deviceTreeLength;
 	char CommandLine[BOOT_LINE_LENGTH];
 	uint64_t bootFlags, memSizeActual;
+	uint64_t marker_pa, marker_magic;	/* SWEET: first-instruction proof */
 };
 
 _Static_assert(__builtin_offsetof(struct payload, segs) == 0x2a8, "payload header layout");
 _Static_assert(__builtin_offsetof(struct boot_args, Video) == 40, "boot_args layout");
 _Static_assert(__builtin_offsetof(struct boot_args, CommandLine) == 108, "boot_args layout");
-_Static_assert(sizeof(struct boot_args) == 736, "boot_args layout");
+/*
+ * 752, not 736: the two SWEET marker fields were appended after memSizeActual. The
+ * kernel's struct boot_args gained the same pair, so both sides are 752. This number has
+ * to move with them -- boot_args is read by the kernel at offsets from genassym.c, and a
+ * size disagreement means the tail fields are read from the wrong place.
+ */
+_Static_assert(sizeof(struct boot_args) == 752, "boot_args layout");
 
 /* MMU off: everything is Device memory, so copy in aligned 8-byte words. */
 static void copy64(uintptr_t dst, uintptr_t src, uint64_t n)
@@ -219,6 +226,19 @@ const char *loader_boot_payload(uintptr_t dtb, uintptr_t payload_pa,
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
+	/*
+	 * First-instruction marker. The kernel writes MARKER to MARKER_PA before it does
+	 * anything else; if that word is still zero when control comes back, the kernel
+	 * never executed a single instruction. The board has no serial port, so this is
+	 * the only way to tell "kernel died early" from "kernel never started".
+	 */
+	uintptr_t marker_pa = ba_pa + sizeof(struct boot_args);
+	marker_pa = (marker_pa + 7) & ~7UL;
+	*(volatile uint64_t *)marker_pa = 0;
+	ba->marker_pa = marker_pa;
+	ba->marker_magic = 0x5357454554ULL;	/* "SWEET" */
+	con_hex("MARKER", marker_pa);
+
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
@@ -226,7 +246,22 @@ const char *loader_boot_payload(uintptr_t dtb, uintptr_t payload_pa,
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
 	((xnu_entry_t)entry_pa)(ba_pa);
-	return "xnu returned";
+
+	/*
+	 * Only reached if the kernel returned, which means it did not take over. Read the
+	 * marker: a non-zero value proves kernel instructions executed.
+	 */
+	{
+		uint64_t got = *(volatile uint64_t *)marker_pa;
+
+		if (got == 0x5357454554ULL) {
+			con_str("KERNEL", "RAN -- the marker was written, then it returned");
+			return "kernel executed and returned";
+		}
+		con_hex("KERNEL", got);
+		con_str("KERNEL", "did NOT reach its first instruction");
+		return "kernel never executed: marker untouched";
+	}
 }
 
 /*

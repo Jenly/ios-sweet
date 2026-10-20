@@ -2,6 +2,60 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-21 #23: QEMU clears chiron's parameters; a marker to end the guessing <<<
+
+**The board parameters are correct.** After an ADT bisection that went wrong and had to be
+redone, the measurement that matters is:
+
+```
+qemu-sweet    undef=0  irq=1478  deepest PC 0xfffffe0007b3dd64
+qemu-chiron   undef=0  irq=1490  deepest PC 0xfffffe0007b3dd64
+```
+
+Identical depth, comparable interrupt counts. Feeding the kernel chiron's DRAM base/size,
+GIC redistributor address and timer INTID changes nothing. So the phone's silence is **not**
+a wrong device tree, DRAM size, GIC address or timer INTID.
+
+**How the wrong conclusion was reached first, because the lesson matters.** The first
+bisection compared `--device sweet` against `--device chiron` under QEMU and found chiron
+"died at `0xfffffe000748c000` with one Undefined Instruction" while sweet reached
+`0xfffffe0007a861c4`. That looked clean and was worthless:
+
+| ADT | size |
+|---|---|
+| `--qemu` | **7,180** bytes |
+| `--device sweet` | **13,928** bytes |
+| `--device chiron` | 13,936 bytes |
+
+`--device` emits a **real hardware** device tree -- the phone's actual GIC, UART, UFS --
+and QEMU implements none of them. Every `--device` ADT dies at the same PC for the same
+irrelevant reason. The tell I ignored: a variant I built to be *identical to a run that
+worked* also died. When the control experiment fails, the harness is wrong.
+
+`--qemu` composes with `--device`, which is what makes the A/B above valid: same emulated
+hardware, different board parameters.
+
+**Patch 0091: make the kernel's first instruction leave proof it ran.** On the phone there
+is no serial port and the display is only reachable much later, so every remaining
+hypothesis about *where* the kernel dies was unfalsifiable. The kernel now writes a magic
+value to a scratch physical address as the first thing `start_first_cpu` does -- before
+`OSLAR_EL1`, before `DAIFSet`, before anything that can fail -- and the shim zeroes that
+word, fills `boot_args.marker_pa`/`marker_magic`, and reads it back.
+
+    marker unchanged  -> the kernel never executed its first instruction
+    marker changed    -> the kernel ran, and died later
+
+One store, no console, no serial port, no timing. `boot_args` grew from 736 to 752 bytes
+for the two fields; the `_Static_assert` in `shim/loader.c` caught the mismatch
+immediately, which is what it is for, and both sides now agree.
+
+Verified with the marker patch in place: QEMU still shows `undef=0`, 1234 IRQs, deepest PC
+`0xfffffe0007a84200` -- the addition broke nothing, and with `marker_pa == 0` the store is
+skipped exactly as designed.
+
+`docs/chiron-params-are-correct.md` records all of it, including the list of nine
+hypotheses now eliminated by measurement rather than argument.
+
 ### >>> UPDATE 2026-10-21 #22: THE HANDOFF IS PROVEN. The kernel is the unknown. <<<
 
 Four boots on hardware produced this, photographed from the panel:

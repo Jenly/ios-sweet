@@ -1,0 +1,62 @@
+diff --git a/osfmk/arm64/genassym.c b/osfmk/arm64/genassym.c
+--- a/osfmk/arm64/genassym.c
++++ b/osfmk/arm64/genassym.c
+@@ -304,6 +304,9 @@
+ 	DECLARE("BA_VIDEO_BASE", offsetof(struct boot_args, Video.v_baseAddr));
+ 	DECLARE("BA_VIDEO_ROW_BYTES", offsetof(struct boot_args, Video.v_rowBytes));
+ 	DECLARE("BA_VIDEO_HEIGHT", offsetof(struct boot_args, Video.v_height));
++	/* SWEET: the first-instruction marker, see boot.h. */
++	DECLARE("BA_MARKER_PA", offsetof(struct boot_args, marker_pa));
++	DECLARE("BA_MARKER_MAGIC", offsetof(struct boot_args, marker_magic));
+ 	DECLARE("BA_BOOT_FLAGS", offsetof(struct boot_args, bootFlags));
+ 
+ 	DECLARE("SR_RESTORE_TCR_EL1", offsetof(struct sysreg_restore, tcr_el1));
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -506,6 +506,27 @@
+ 	.globl EXT(start_first_cpu)
+ LEXT(start_first_cpu)
+ 
++#if defined(SWEET)
++	/*
++	 * FIRST THING THE KERNEL DOES. Leave proof of execution where the boot shim can
++	 * read it back and print it, because this board has no serial port and the
++	 * display is only reachable much later.
++	 *
++	 *   marker_pa == 0            -> feature disabled, skip
++	 *   otherwise                 -> *marker_pa = marker_magic
++	 *
++	 * The shim zeroes the word and prints it after returning from a failed boot; a
++	 * value here means kernel code ran. One store, no branches, nothing that can
++	 * fault for an interesting reason.
++	 */
++	ldr		x9, [x20, BA_MARKER_PA]
++	cbz		x9, Lsweet_no_marker
++	ldr		x10, [x20, BA_MARKER_MAGIC]
++	str		x10, [x9]
++	dsb		sy
++Lsweet_no_marker:
++#endif
++
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+diff --git a/pexpert/pexpert/arm64/boot.h b/pexpert/pexpert/arm64/boot.h
+--- a/pexpert/pexpert/arm64/boot.h
++++ b/pexpert/pexpert/arm64/boot.h
+@@ -69,6 +69,14 @@
+ 	char                    CommandLine[BOOT_LINE_LENGTH];  /* Passed in command line */
+ 	uint64_t                bootFlags;              /* Additional flags specified by the bootloader */
+ 	uint64_t                memSizeActual;          /* Actual size of memory */
++
++	/*
++	 * SWEET: a scratch physical address and a value the kernel writes there as its
++	 * very first action, so the boot shim can tell whether kernel code ever ran on a
++	 * board with no serial port. Zero means "disabled".
++	 */
++	uint64_t                marker_pa;
++	uint64_t                marker_magic;
+ } boot_args;
+ 
+ #define SOC_DEVICE_TYPE_BUFFER_SIZE     32
