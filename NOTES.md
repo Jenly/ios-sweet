@@ -2,6 +2,71 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-21 #22: THE HANDOFF IS PROVEN. The kernel is the unknown. <<<
+
+Four boots on hardware produced this, photographed from the panel:
+
+```
+INITRD  lo=43400000  hi=443E0F50
+PAYLOAD lo=43400000  hi=443E0F50
+PAYLEN  need=0FE0F50  avail=0FE0F50
+PHYS    base=100000000  size=BD8C0000
+ENTRY   FFFFFE0007490488
+SEGS    n=0000000A  bad=00000000
+FB      base=9D400000  w=438  h=870  stride=10E0
+BOOTARG pa=024D4000  top=024D8000
+JUMP    0000000101490488
+XNU     jumping (fbcon clears screen)
+```
+
+**Four claims are now measurements, not inferences:**
+
+1. **The payload arrives complete.** `avail = 0xFE0F50 = 16,650,064` = `need`. The
+   earlier `avail = 45,616` was a stale image, not a transport limit. I spent two
+   attempts designing around a bootloader limit that did not exist.
+
+2. **The copy lands.** `bad=00000000` comes from reading every segment back out of its
+   destination and comparing against the source -- 16 samples x 10 segments. This rules
+   out "the destination is not RAM", which was the leading suspicion because the
+   payload's `phys_base`/`mem_size` come from `tools/devices.py`'s **6 GB** chiron entry
+   and this handset may be the 4 GB variant.
+
+3. **The entry point is correct.** `entry_va 0xfffffe0007490488` is segment 2 at
+   `+0x1a8488`, file offset `0x48c878`, where the bytes are `19070014` = `b +0x1c64` --
+   a branch over exactly sixteen `nop`s, which is `LowExceptionVectorBase`'s `.align 12`
+   padding. That is `_start`: `b EXT(start_first_cpu)` plus the low exception vector
+   table. Not mid-function code, not zeroes.
+
+4. **The jump address is right.** `0x101490488` = `entry_va + (phys_base - virt_base)`.
+
+**So everything the shim is responsible for works.** Boot image format, load addresses,
+framebuffer, device tree, payload header, segment copy, entry point, jump -- all
+correct, all measured.
+
+`RAMNODE none found` is **not a fault**: chiron's device tree has no `/memory` node and
+should not. The kernel gets RAM from the **Apple** device tree the shim places behind it
+(`dram-base`/`dram-size`, magic `0x09000000`), not from the FDT. I wrote that check
+against the wrong format; its "none found" is the expected answer.
+
+**What is left:** the kernel is entered correctly and produces nothing. It does not
+panic on screen, does not draw, does not print. Nothing the shim does can narrow this
+further, because the next instruction executed is kernel code and the observation after
+that is silence.
+
+`docs/chiron-handoff-proven.md` records all of it. The next attempt should not look at
+the shim or the boot image. The cheapest informative experiment is the **QEMU twin**
+(`tools/qemu-sweet.py --fail-on-panic`): it turns "silence on hardware" into a panic
+message and a PC. If the same image boots there, the fault is hardware-specific; if it
+fails identically, it is reproducible under a debugger.
+
+Ruled out along the way, with the evidence:
+- header v2/v1 (`remote: 'BootImage is Incomplete'`; only **v0**, the 1632-byte struct,
+  is accepted, and the DTB must be *appended* to the kernel)
+- payload truncation (`avail` == `need`)
+- copy failure (`bad=00000000`)
+- the five hardcoded `0x9c000000` sites (patch 0090, in this image; the kernel never
+  reached the code that draws with them)
+
 ### >>> UPDATE 2026-10-21 #21: THE KERNEL HAD SWEET'S FRAMEBUFFER HARDCODED <<<
 
 **This is the answer, and it was in the source the whole time -- I had been guessing

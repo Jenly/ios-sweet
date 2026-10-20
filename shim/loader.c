@@ -11,6 +11,7 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#include "verify.h"
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -97,6 +98,9 @@ const char *loader_boot_payload(uintptr_t dtb, uintptr_t payload_pa,
 
 	con_hex2("PAYLOAD", "lo=", rd_start, "hi=", rd_end);
 
+	/* What RAM does the bootloader say this handset has? Not the table's guess. */
+	verify_memory_report(dtb);
+
 	const struct payload *p = (const struct payload *)rd_start;
 	if (!magic_ok(p->magic))
 		return "no SWEETXNU payload";
@@ -141,14 +145,34 @@ const char *loader_boot_payload(uintptr_t dtb, uintptr_t payload_pa,
 	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
 		return "ramdisk overlaps kernel memory";
 
+	uint32_t bad_segs = 0;
+
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
-		copy64(dst, rd_start + s->file_off, s->file_size);
+		uintptr_t src = rd_start + s->file_off;
+		copy64(dst, src, s->file_size);
 		if (s->vmsize > s->file_size)
 			zero64(dst + ((s->file_size + 7) & ~7UL), s->vmsize - ((s->file_size + 7) & ~7UL));
+
+		/*
+		 * Did it land? The destination may not be RAM: the payload's phys_base
+		 * comes from tools/devices.py's 6 GB chiron entry, and if this handset is
+		 * the 4 GB variant the upper bank is shorter than mem_size claims. Past
+		 * that point the copy writes into nothing.
+		 */
+		uint32_t bad = verify_copy(src, dst, s->file_size, 16);
+		if (bad != 0) {
+			con_hex2("SEG", "idx=", i, "bad=", bad);
+			bad_segs++;
+		}
 	}
-	con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base);
+	con_hex2("SEGS", "n=", p->nsegs, "bad=", bad_segs);
+	if (bad_segs != 0) {
+		con_str("COPY", "FAILED -- destination is not usable RAM");
+		con_str("COPY", "refusing to jump; check the RAM layout above");
+		return "kernel copy did not land: the destination is not RAM";
+	}
 
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
