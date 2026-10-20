@@ -104,6 +104,34 @@ else
 	skip "EFI handoff trampoline" "tools/test-efi-handoff.sh missing"
 fi
 
+# Constants that must be 64-bit on BOTH data models. `1UL << 53` is right for
+# aarch64-linux-gnu and evaluates to 0 for aarch64-pc-win32-coff, and the EFI build
+# carried on with only a warning -- producing page tables whose PXN and UXN bits
+# were clear, i.e. Device carve-outs left executable.
+if [ -x tools/test-llp64.sh ]; then
+	if command -v clang >/dev/null 2>&1; then
+		run "LLP64 constants" ./tools/test-llp64.sh
+	else
+		skip "LLP64 constants" "no clang"
+	fi
+else
+	skip "LLP64 constants" "tools/test-llp64.sh missing"
+fi
+
+# A built chiron boot.img, when one is present. This is the only check that looks
+# at the actual flashable artifact: kernel, payload-as-ramdisk and device tree all in
+# one file, with the header fields that decide whether fastboot accepts it.
+CHIRON_IMG=
+for cand in out-chiron/shim-boot-chiron.img shim/out/shim-boot-chiron.img; do
+	if [ -f "$cand" ]; then CHIRON_IMG=$cand; break; fi
+done
+if [ -n "$CHIRON_IMG" ]; then
+	run "chiron boot image" python3 tools/test-bootimg.py "$CHIRON_IMG" \
+	    --expect-dtb-addr 0x1f00000
+else
+	skip "chiron boot image" "not built (tools/build-chiron.sh KERNEL)"
+fi
+
 # The EFI application's PE headers. "It built" is not "firmware can load it": a
 # wrong machine type, PE32 instead of PE32+, or subsystem 3 instead of 10 all link
 # without complaint and are then rejected with no useful message. Skipped when

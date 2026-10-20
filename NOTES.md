@@ -2,6 +2,76 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-20 #20: the basic platform builds end to end <<<
+
+The goal was a chiron boot image from a CI kernel with one command. That now
+exists: `tools/build-chiron.sh KERNEL` produces
+
+```
+out-chiron/adt.bin                          13,936 bytes   (chiron ADT)
+out-chiron/payload.bin                  16,649,952 bytes   (SWEETXNU, 10 segments)
+out-chiron/shim-boot-chiron.img         17,264,640 bytes   (flash this)
+```
+
+`fastboot boot out-chiron/shim-boot-chiron.img`.
+
+The four steps existed already -- `mkadt.py`, `mkpayload.py`, `shim/build.sh
+--device chiron`, `mkbootimg` -- but only as four commands with a device-tree path
+remembered by hand. Now they are one command with the input checks that used to
+live in my head.
+
+**Three bugs had to be fixed to get there, all of them found by running it:**
+
+1. **`shim/build.sh` had a UTF-8 BOM**, so `#!/bin/bash` was not a shebang and the
+   step never ran at all -- `./shim/build.sh: line 1: #!/bin/bash: No such file or
+   directory`. Stripping it also dropped the executable bit, which was the next
+   error and looked unrelated.
+2. **`DTB` and `MKBOOTIMG` were not passed through.** `build-chiron.sh` exported
+   them to `shim/build.sh`, but `build.sh` `cd`s into `shim/` and resolves the paths
+   from there, so the payload argument was relative and vanished.
+3. **The image verification I wrote was wrong, twice.** I read `dtb_size` at offset
+   1632 and reported "no device tree embedded", then "dtb_size is 0". Offset 1632 is
+   `recovery_dtbo_size`, which is *supposed* to be zero; the real `dtb_size` is at
+   1648. **The image was complete the whole time.** Both false reports were my
+   arithmetic, not the build.
+
+`tools/test-bootimg.py` now holds the v2 layout with each offset written out, and
+checks the things that decide whether `fastboot boot` will accept the file: magic,
+header version and size, a non-empty kernel, a ramdisk large enough to be the
+payload, `dtb_size > 0`, `dtb_addr == 0x1f00000`, the SWEETXNU magic at the computed
+ramdisk offset with version 1 and a plausible segment count, and an **exact** file
+length.
+
+The length check was `>=` at first, and the injection test caught it: a truncated
+image that had lost its device tree passed. A boot image is fully described by its
+header, so its length is a definite number; `==` now, and truncation fails.
+
+Verified able to fail: wrong `dtb_addr` is caught, a truncated image is caught, and
+random bytes are caught on the magic alone.
+
+**A second real bug, in the MMU code, found by the same work.** The EFI target is
+`aarch64-pc-win32-coff`, which is **LLP64**: `unsigned long` is 32 bits there.
+`mmu.c` wrote its page-table constants as `1UL << n`, so under that target
+`D_PXN (1UL << 53)`, `D_UXN (1UL << 54)` and `TCR (1UL << 32)` all evaluated to
+**zero**. clang warned and carried on:
+
+```
+warning: shift count >= width of type
+```
+
+With PXN and UXN zero every Device descriptor in the page table becomes
+**executable**, and losing TCR bit 32 changes the physical address size. The EFI
+application would have linked, been 9,216 bytes, and been silently wrong. All
+sixteen shifted constants now use `UINT64_C`, and the disassembly confirms it:
+`movk x13, #0x60, lsl #48` carries both PXN and UXN, `movk x11, #0x1, lsl #32` the
+TCR bit.
+
+`tools/test-llp64.sh` compiles the constants and `mmu.c` for **both** data models
+with `-Werror=shift-count-overflow`, and runs a runtime value check on the host.
+Reverting `mmu.c` to `1UL` fails it; so does fixing only some of the constants.
+
+`tools/test.sh` now runs **ten** checks, all passing.
+
 ### >>> UPDATE 2026-10-20 #19: the shim builds as an EFI application <<<
 
 `./shim/build.sh` now produces **two** outputs from the same sources:

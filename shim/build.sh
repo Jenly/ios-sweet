@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 # Build the shim and wrap it in a boot.img v2.
 #
 #   ./build.sh                 # sweet: kernel-only build (no payload), needs ../dtb/

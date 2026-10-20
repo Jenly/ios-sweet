@@ -15,9 +15,9 @@
 #include "mmu.h"
 
 #define PG_SHIFT	14
-#define PG_SIZE		(1UL << PG_SHIFT)		/* 16K */
+#define PG_SIZE		(UINT64_C(1) << PG_SHIFT)		/* 16K */
 #define BLK_SHIFT	25
-#define BLK_SIZE	(1UL << BLK_SHIFT)		/* 32MB level-2 block */
+#define BLK_SIZE	(UINT64_C(1) << BLK_SHIFT)		/* 32MB level-2 block */
 #define NENT		2048
 
 #define ATTR_DEV	0	/* MAIR attr0 = 0x00 Device-nGnRnE */
@@ -25,29 +25,29 @@
 #define ATTR_NC		2	/* MAIR attr2 = 0x44 Normal non-cacheable */
 #define MAIR_VAL	0x44ff00UL
 
-#define D_BLOCK		1UL
+#define D_BLOCK		UINT64_C(1)
 #define D_TABLE		3UL
 #define D_PAGE		3UL
 #define D_ATTR(i)	((uint64_t)(i) << 2)
 #define D_SH_OUTER	(2UL << 8)
 #define D_SH_INNER	(3UL << 8)
-#define D_AF		(1UL << 10)
-#define D_PXN		(1UL << 53)
-#define D_UXN		(1UL << 54)
+#define D_AF		(UINT64_C(1) << 10)
+#define D_PXN		(UINT64_C(1) << 53)
+#define D_UXN		(UINT64_C(1) << 54)
 
 #define DEV_FLAGS	(D_ATTR(ATTR_DEV) | D_AF | D_PXN | D_UXN)
 #define WB_FLAGS	(D_ATTR(ATTR_WB) | D_SH_INNER | D_AF | D_UXN)
 #define NC_FLAGS	(D_ATTR(ATTR_NC) | D_SH_OUTER | D_AF | D_PXN | D_UXN)
 
 /* TCR: T0SZ=28, IRGN0/ORGN0=WBWA, SH0=inner, TG0=16K, EPD1, TG1=16K, IPS=36 bit */
-#define TCR_VAL		(28UL | (1UL << 8) | (1UL << 10) | (3UL << 12) | (2UL << 14) | \
-			 (28UL << 16) | (1UL << 23) | (1UL << 30) | (1UL << 32))
+#define TCR_VAL		(28UL | (UINT64_C(1) << 8) | (UINT64_C(1) << 10) | (3UL << 12) | (2UL << 14) | \
+			 (28UL << 16) | (UINT64_C(1) << 23) | (UINT64_C(1) << 30) | (UINT64_C(1) << 32))
 
-#define SCTLR_M		(1UL << 0)
-#define SCTLR_A		(1UL << 1)
-#define SCTLR_C		(1UL << 2)
-#define SCTLR_I		(1UL << 12)
-#define SCTLR_WXN	(1UL << 19)
+#define SCTLR_M		(UINT64_C(1) << 0)
+#define SCTLR_A		(UINT64_C(1) << 1)
+#define SCTLR_C		(UINT64_C(1) << 2)
+#define SCTLR_I		(UINT64_C(1) << 12)
+#define SCTLR_WXN	(UINT64_C(1) << 19)
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
