@@ -15,12 +15,43 @@ volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
 static uint32_t con_bg;
 static int row;
 
-void con_clear(uint32_t bg)
+/*
+ * Rows the console can write to. 40 rows of CH_H at SCALE 3 is 40 * 48 = 1920 px,
+ * which fits chiron's 2160-tall panel with room to spare.
+ */
+#define TEXT_ROWS	40
+
+void con_clear_full(uint32_t bg)
 {
 	for (int y = 0; y < FB_H; y++) {
 		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
 		for (int x = 0; x < FB_W; x++)
 			line[x] = bg;
+	}
+	con_bg = bg;
+	row = 0;
+}
+
+/*
+ * Clear only the band the text occupies.
+ *
+ * This is the default because a full 1080x2160 fill is 2.3 million Device-memory
+ * stores with the MMU off, and doing it first meant a shim that appeared to do
+ * nothing for an unbounded time -- indistinguishable from never having started. The
+ * band is about 1/27th of that and is all that text needs.
+ */
+void con_clear(uint32_t bg)
+{
+	int band = MARGIN * 2 + TEXT_ROWS * CH_H;
+
+	if (band > FB_H) {
+		band = FB_H;
+	}
+	for (int y = 0; y < band; y++) {
+		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
+		for (int x = 0; x < FB_W; x++) {
+			line[x] = bg;
+		}
 	}
 	con_bg = bg;
 	row = 0;

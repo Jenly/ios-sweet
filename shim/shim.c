@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "mmu.h"
+#include "earlylog.h"
 #include "loader.h"
 #include "ufs.h"
 
@@ -149,6 +150,8 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 		irq_handler();
 		return;
 	}
+	/* The long fill starts here; amber means we survived it. */
+	early_block(EARLY_DTB);
 	con_clear(BLUE);
 	switch (slot & 3) {
 	case 0: con_str("PANIC", "SYNC"); break;
@@ -382,6 +385,14 @@ static uint32_t to_us(uint64_t ticks)
 
 void shim_main(uint64_t dtb)
 {
+	/*
+	 * FIRST, before anything that can take a long time or fault: paint a block.
+	 * If it is not on the panel, nothing below this line ever ran -- the load
+	 * address or the framebuffer address is wrong, and no in-shim logging could
+	 * have told us that. See earlylog.c.
+	 */
+	early_block(EARLY_STARTED);
+
 	struct mmu_info mi;
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */

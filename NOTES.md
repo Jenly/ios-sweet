@@ -2,6 +2,72 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-21 #21: THE KERNEL HAD SWEET'S FRAMEBUFFER HARDCODED <<<
+
+**This is the answer, and it was in the source the whole time -- I had been guessing
+at the bootloader.**
+
+`osfmk/arm64/start.s`, inside `start_first_cpu`, before any stack or page table exists:
+
+```asm
+#if defined(SWEET)
+    /* Stage 0: white 64x32 band, no stack or page tables needed. */
+    MOV64   x0, (0x9c000000 + 2368 * 4320)
+```
+
+`0x9c000000` is **sweet's** splash region. chiron's is **`0x9d400000`** -- the shim
+printed it on the panel, and it matches `splash_region@9d600000`'s
+`reg = <0x9d400000 0x2400000>`. So the kernel's very first store went 20 MiB into
+memory that is not the display, with no stack, no exception handler that can print and
+nothing to report with. It stopped there and the panel kept the shim's last line.
+
+That explains the observation exactly, and unlike "the payload is truncated" it is
+unconditional and happens before anything else.
+
+**Five sites, all carrying sweet's constant:**
+
+| file | line | what |
+|---|---|---|
+| `start.s` | 518 | stage-0 band `0x9c000000 + 2368*4320` |
+| `start.s` | 521 | its stride `4320` |
+| `start.s` | 689 | a later stage `MOV64 x10, 0x9c000000` |
+| `arm_vm_init.c` | 1846 | the Normal-NC page-table alias |
+| `sweet_early.c` | 14 | the bootstrap console |
+
+**Patch 0090** removes all five:
+
+- `genassym.c` exports `BA_VIDEO_BASE`, `BA_VIDEO_ROW_BYTES`, `BA_VIDEO_HEIGHT`.
+- `start.s` reads them from `x20`, which already holds the boot_args physical address
+  at that point. No new register, no new dependency. The band moves to the top of the
+  panel: it used to be at row 2368 of a 2400-row screen and chiron has 2160.
+- `arm_vm_init(memory_size, boot_args *args)` sets `sweet_fb_pa` and calls
+  `sweet_early_set_fb()` from `args->Video`, and the alias uses that. It prints
+  `SWEET FB: <addr> <w>x<h> stride <n> from boot_args` so the next boot states what it
+  used.
+- The early console's panel geometry stops being compile-time constants. This matters
+  beyond chiron: that console is what reports a panic before the real one exists, and
+  on chiron it was writing 2400 rows of text to a 2160-row panel from an address 20 MiB
+  off -- silence at the worst possible moment.
+
+Defaults stay sweet's, so a path that never calls the setter behaves exactly as before.
+A zero or implausible boot_args value leaves the defaults in place rather than
+installing a bad pointer.
+
+Verified: 0001-0090 applies with 0 failures, 10/10 TUs compile, 618/618 undefined
+symbols resolve with 0 orphans, header-export clean.
+
+**Also added, and it is what was asked for:** `loader.c` now computes the payload
+region it needs (`max(file_off + file_size)` over all segments, plus the ADT) and
+compares it with what the bootloader supplied, printing
+
+```
+PAYLEN  need=xxxxxxxx  avail=xxxxxxxx
+```
+
+before any copy, and refusing to jump if the region is short. The shim previously
+validated only the ~700-byte header and then copied 16 MB from wherever the header
+said. The phone reported `avail = 45,616`; the payload is 16,649,952.
+
 ### >>> UPDATE 2026-10-20 #20: the basic platform builds end to end <<<
 
 The goal was a chiron boot image from a CI kernel with one command. That now

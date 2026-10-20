@@ -22,7 +22,10 @@
 
 extern volatile uint32_t *con_fb;
 
+/* Clear the band the text uses. Cheap enough to do before anything else. */
 void con_clear(uint32_t bg);
+/* Clear the entire panel. 2.3 million Device-memory stores: use deliberately. */
+void con_clear_full(uint32_t bg);
 void con_skip(void);
 void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);

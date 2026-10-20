@@ -35,15 +35,15 @@ READELF=${CROSS_COMPILE:-aarch64-linux-gnu-}readelf
 NM=${CROSS_COMPILE:-aarch64-linux-gnu-}nm
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 mkdir -p out
-for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
+for f in start.S shim.c console.c earlylog.c mmu.c fdt.c loader.c ufs.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 done
 # The image runs wherever the bootloader puts it with no relocation pass: only
 # the header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$($READELF -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o | grep -c ABS64 || true)
+abs=$($READELF -r out/shim.o out/console.o out/earlylog.o out/mmu.o out/fdt.o out/loader.o out/ufs.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
+	out/start.o out/shim.o out/console.o out/earlylog.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
 # The bootloader copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
 size=$($NM out/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
@@ -126,11 +126,16 @@ if [ -z "$MKBOOTIMG_BIN" ]; then
 	exit 1
 fi
 
+# --base 0x10000000, NOT 0. With --base 0 the shim is loaded at 0x8000, which is
+# not RAM: `fastboot boot` reports OKAY, the bootloader copies the image there and
+# branches, and nothing ever executes. The screen does not change. Verified the hard
+# way. 0x10000000 + 0x8000 = 0x10008000, inside chiron's low DDR bank.
 # sweet mirrors the stock PixelOS header; the msm8998 UEFI/ABL path only needs
 # the payload (nothing flashes these images: fastboot boot / UEFI loads them).
 "$MKBOOTIMG_BIN" --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
-	"${DTB_ARGS[@]}" --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-	--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
+	"${DTB_ARGS[@]}" --base 0x10000000 --kernel_offset 0x8000 \
+	--ramdisk_offset 0x1000000 --tags_offset 0x100 --dtb_offset 0x1f00000 \
+	--pagesize 4096 \
 	--os_version 17.0.0 --os_patch_level 2035-06 \
 	--cmdline "console=null" -o "out/shim-boot-$DEVICE.img"
 cp "out/shim-boot-$DEVICE.img" out/shim-boot.img

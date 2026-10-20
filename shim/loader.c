@@ -103,6 +103,35 @@ const char *loader_boot_payload(uintptr_t dtb, uintptr_t payload_pa,
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
+	/*
+	 * How much of the payload does the header claim? Segments are stored at
+	 * file offsets, so the requirement is the largest file_off + file_size, plus
+	 * the ADT wherever it sits.
+	 */
+	uint64_t need = p->adt_off + p->adt_size;
+	for (uint32_t i = 0; i < p->nsegs; i++) {
+		uint64_t end = p->segs[i].file_off + p->segs[i].file_size;
+		if (end > need) {
+			need = end;
+		}
+	}
+
+	/*
+	 * And how much did the bootloader give us? This is the check that was
+	 * missing: with the region short, every byte past its end is unrelated RAM,
+	 * and the copy below would happily move it into the kernel's place and jump.
+	 */
+	uint64_t avail = payload_len;
+	con_hex2("PAYLEN", "need=", (uint32_t)need, "avail=", (uint32_t)avail);
+	con_hex2("PAYLEN", "need_hi=", (uint32_t)(need >> 32), "avail_hi=",
+	    (uint32_t)(avail >> 32));
+
+	if (need > avail) {
+		con_str("PAYLOAD", "TRUNCATED -- refusing to jump");
+		con_hex2("SHORT", "by=", (uint32_t)(need - avail), "segs=", p->nsegs);
+		return "payload is truncated: the bootloader did not load all of it";
+	}
+
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
 	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
 	con_hex("VIRT", p->virt_base);
