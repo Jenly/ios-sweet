@@ -2,6 +2,71 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-22 #26: all five bands appeared -- the kernel reaches common_start and stops there <<<
+
+**The 0092 result on hardware.** `fastboot boot boot-bands92.img` showed the shim console
+plus the band strip. Read at native resolution, all five were present:
+
+```
+0xfffffe0007492120  0xFFFFFFFF  white   CP1 marker store done
+0xfffffe000749218c  0xFF00FF00  green   CP2 stage-0 band drawn
+0xfffffe00074921d8  0xFFFF0000  red     CP3 own VBAR installed
+0xfffffe0007492404  0xFFFFFF00  yellow  CP4 page tables built
+0xfffffe000749246c  0xFFFF00FF  magenta CP5 -> common_start
+```
+
+Those addresses come from disassembling the built kernel, not from the source, so the
+bands provably reached the image. Two things follow:
+
+- the boot gets all the way through `start_first_cpu`, including both bootstrap mappings
+  and the pre-MMU framebuffer mapping;
+- the earlier "no band" reading of the 0091-fix image was correct -- the fault that time
+  was the probe itself, and now it is not.
+
+The panel still shows the shim's console afterwards, which is consistent: fbcon never
+runs, so nothing repaints the screen. The kernel dies inside `common_start`, before it
+hands off to `arm_init`.
+
+**Reading the photo took two attempts, recorded because the first one was wrong.**
+A whole-panel colour histogram reported "red: 1,477,238 px" and looked like a clean sweep
+-- but the console background IS orange-red, so "red" was the background. The colours that
+are unambiguous (green, magenta, yellow) were found by their narrow hue windows, and the
+band pixels were then confirmed by disassembling the kernel and matching each band's exact
+constant. A measurement that cannot distinguish the signal from the background is not a
+measurement.
+
+**0093: five more bands, continuing the count.**
+
+| band | colour | meaning |
+|---|---|---|
+| 6 | cyan | entered `common_start` |
+| 7 | grey | about to enable the MMU |
+| 8 | blue | MMU enabled |
+| 9 | orange | CPACR/NEON set |
+| 10 | violet | about to return into `arm_init` |
+
+**The address trap, which is the interesting part.** After `MSR_SCTLR_EL1_X0` the MMU is
+on, so the obvious move is to convert the panel's physical address to a KVA. That would be
+wrong on this board, and would have produced a fake failure at precisely the location this
+patch is meant to observe:
+
+- `TTBR0` holds the **V=P (identity)** table, `TTBR1` the KVA table (`start.s:854-869`);
+- `T0SZ_BOOT` is **17** for 16K pages, so `TTBR0` translates VA `0..2^47` one-to-one;
+- the panel is at `0x9D400000`, inside that window, and the SWEET block at
+  `start.s:796-811` installs its block descriptor in the V=P L2 page itself;
+- `physBase` is `0x100000000`, so `pa + virtBase - physBase` = `0xfffffdff9d400000`,
+  which sits **below** the kernel mapping in the TTBR1 window where nothing is mapped.
+
+So CP8-CP10 keep the physical address. The first draft of 0093 did the conversion and was
+caught by checking the page tables rather than by reasoning about what should work.
+
+**Two process notes.** A `re.sub` replacement written through a triple-quoted string
+delivered a literal `\1` into `start.s` and corrupted the file; 0093 was rebuilt from the
+0001-0092 base with plain string operations. And the first "are the bands in the binary?"
+check searched for `movk` with the wrong mask, reported all five missing, and was wrong --
+the bands had been there all along. Both are the same failure mode: trusting a check whose
+negative result was not itself verified.
+
 ### >>> UPDATE 2026-10-21 #25: staged colour bands, because the panel is the only output <<<
 
 **What the 0091 fix produced on hardware: no PANIC, no band, then a watchdog reset.**
