@@ -2,6 +2,69 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-21 #25: staged colour bands, because the panel is the only output <<<
+
+**What the 0091 fix produced on hardware: no PANIC, no band, then a watchdog reset.**
+
+`fastboot boot boot-fix92.img` (payload from CI run `39626763523`) reached the shim and
+printed its console correctly, including the fields that matter:
+
+```
+MARKER   00000001024D42F0     = boot_args PA + 0x2F0 (752 = sizeof(struct boot_args))
+SEGS     n=0000000A bad=00000000     every segment copy verified
+FB       base=9D400000 w=00000438 h=00000870 stride=10E0    chiron's real panel
+```
+
+`BOOTARG pa=024D4000` and `PHYS base=00000000` look truncated because `con_hex2` prints
+the low 32 bits only; the real values are `0x1024D4000` and `0x100000000`.
+
+Then `XNU jumping`, and nothing. No PANIC SYNC (so the 0091 alignment fault is gone --
+the probe now runs with a valid `x20`), no white stage-0 band, and the device reset a
+few minutes later.
+
+**Why there is no error report, structurally.** `start_first_cpu` installs its own VBAR
+(`MSR_VBAR_EL1_X0`) a handful of instructions in, and the early handlers at
+`LowExceptionVectorBase` are `b .` -- infinite loops (see the top of `start.s`). Before
+that install an exception reaches the shim's vectors and paints PANIC SYNC; after it,
+a fault produces no console, no report, nothing but a hang. The boot is dying inside
+exactly the window where the kernel cannot say anything.
+
+**0092: paint the panel from inside that window.** Five checkpoints, each a 64x12 band
+at row `800 + idx*16` (below the shim's text, so one photograph shows both). The number
+of bands is the number of checkpoints passed:
+
+| band | colour | meaning |
+|---|---|---|
+| 1 | white | marker store completed (0091's probe) |
+| 2 | green | pre-existing stage-0 band drawn -> FB writes work |
+| 3 | red | own VBAR installed -> from here a fault hangs silently |
+| 4 | yellow | both bootstrap page tables built |
+| 5 | magenta | about to branch into `common_start` |
+
+If only white appears, the stage-0 band loop is the problem. White+green but no red
+means it died between them, in code that reads boot_args fields. Up to yellow means the
+page tables are fine and it died on the way into `common_start`.
+
+**Two traps avoided, both by checking rather than assuming:**
+
+1. *Register liveness.* The macro uses `x9`-`x13`; the kernel has no stack yet, so
+   saving is not an option. A liveness scan over the following 40 instructions at each
+   site asserts none of those five is read before being rewritten. Patch 0091 shipped a
+   probe that assumed `x20` held boot_args; it did not, and that cost a hardware cycle.
+   The same class of mistake is now checked, not eyeballed.
+
+2. *`MOV64` cannot take a macro parameter.* `MOV64 x12, \colour` assembles under an
+   Apple target but substitutes the parameter without its shift expression, emitting
+   `movk x12, #0x0` for a `0xFFFF0000` colour -- a band in the wrong colour. Since a
+   misleading band would defeat the point of the patch, the macro builds the constant
+   with `movz`/`movk` and the encoding was verified by assembling it standalone.
+
+**Also fixed while generating the patch:** removing a misplaced CP3 (it first landed in
+`reset_vector`, the PSCI secondary-CPU path, because `MSR_VBAR_EL1_X0` occurs three times
+in the file) left a stray blank line there. 0092 now contains only the staged-band work.
+
+0092 applies with zero fuzz on 0001-0091 and reproduces the working tree byte for byte.
+
 ### >>> UPDATE 2026-10-21 #24: 0091 crashed the kernel it was meant to observe <<<
 
 **The phone's PANIC SYNC dump, read off a photograph at native resolution** (the earlier

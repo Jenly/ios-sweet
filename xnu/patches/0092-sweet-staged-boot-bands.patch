@@ -1,0 +1,99 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -497,6 +497,44 @@
+ 2:
+ .endmacro
+ 
++#if defined(SWEET)
++/*
++ * SWEET staged boot band.
++ *
++ * Paints a 64x12 band at row (800 + idx*16), so the bands sit well below the shim's
++ * console text (which ends around row 650) and both stay readable on one screen.
++ *
++ * Registers x9-x13 only: every call site below is at a point where those five are
++ * dead. That is deliberate -- saving to the stack is not an option before the kernel
++ * has set up its own, and a probe that clobbers a live register produces exactly the
++ * class of bug that 0091 shipped with.
++ *
++ * MMU is off at all five sites, so every access is Device memory and the write is a
++ * plain physical store to the framebuffer that boot_args names.
++ */
++.macro SWEET_STAGE idx, colour
++	ldr		x9, [x20, BA_VIDEO_BASE]
++	ldr		x10, [x20, BA_VIDEO_ROW_BYTES]
++	mov		x11, #(800 + \idx * 16)
++	madd	x9, x10, x11, x9
++	/* The colour is <= 32 bits: build it without nesting MOV64, which
++	 * does not substitute a macro parameter into its shift expression. */
++	movz	x12, #((\colour >> 0) & 0xFFFF)
++	movk	x12, #((\colour >> 16) & 0xFFFF), lsl #16
++	mov		x13, #12
++Lsweet_stage_row\@:
++	mov		x11, #16
++Lsweet_stage_px\@:
++	str		w12, [x9], #4
++	subs	x11, x11, #1
++	b.ne	Lsweet_stage_px\@
++	add		x9, x9, x10
++	sub		x9, x9, #64
++	subs	x13, x13, #1
++	b.ne	Lsweet_stage_row\@
++.endm
++#endif
++
+ /*
+  * _start_first_cpu
+  * Cold boot init routine.  Called from __start
+@@ -506,6 +544,7 @@
+ 	.globl EXT(start_first_cpu)
+ LEXT(start_first_cpu)
+ 
++
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+@@ -538,6 +577,8 @@
+ Lsweet_no_marker:
+ #endif
+ 
++	SWEET_STAGE 1, 0xFFFFFFFF	/* white: marker done */
++
+ #if defined(SWEET)
+ 	/*
+ 	 * Stage 0: white 64x32 band, no stack or page tables needed.
+@@ -568,6 +609,7 @@
+ 	add		x0, x0, x4
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
++	SWEET_STAGE 2, 0xFF00FF00	/* green: stage-0 band drawn */
+ 	dsb		sy
+ #endif
+ 
+@@ -575,6 +617,7 @@
+ 	adrp	x0, EXT(LowExceptionVectorBase)@page
+ 	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
+ 	MSR_VBAR_EL1_X0
++	SWEET_STAGE 3, 0xFFFF0000	/* red: own VBAR installed */
+ 
+ 
+ 	// Get the kernel memory parameters from the boot args
+@@ -717,6 +760,8 @@
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
++	SWEET_STAGE 4, 0xFFFFFF00	/* yellow: page tables built */
++
+ #if defined(SWEET)
+ 	/*
+ 	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+@@ -737,6 +782,8 @@
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+ 
++	SWEET_STAGE 5, 0xFFFF00FF	/* magenta: about to enter common_start */
++
+ 
+ 	b		common_start
+ 
