@@ -178,6 +178,48 @@ The first number missing from the panel is the answer. If 23 appears and 24 does
 fault is in enabling the MMU or in the first instruction fetched through the new
 translation -- which is a concrete, arguable hypothesis instead of a colour.
 
+### >>> UPDATE 2026-10-22 #29: QEMU caught the log macro writing through a dead lr <<<
+
+**The gate that worked.** Before any hardware run, QEMU on the new kernel:
+
+```
+0092 kernel: 0 Data Aborts, 959 IRQs
+0094 kernel: 1 Data Abort, 0 IRQs
+             ESR 0x25/0x96000040   translation fault, level 0
+             FAR 0xfffffe00080bbfd0   inside __BOOTDATA
+             ELR 0x101489118          stp x22, x21, [sp, #-48]
+```
+
+A level-0 translation fault on a *stack store* means `sp` was already wrong when that
+function was entered -- so a caller's return address had been destroyed.
+
+**Cause: `lr` saved in x16.** x16/x17 are intra-procedure-call scratch in AAPCS64; a C
+function may use them freely, and `sweet_early_mark()` does. `lr` came back clobbered, the
+caller returned into nowhere, and the next stack write landed in `__BOOTDATA`. The macro
+now uses **x28**, which `start.s` does not touch anywhere, so the slot is provably free at
+all five sites.
+
+**This is the second probe in this port to fail the same way.** 0091 read `x20` before
+`mov x20, x0` had executed and faulted at `0x5357454834`. Both bugs are a debug aid
+sampling state it assumed rather than state it had established. Neither was visible by
+reading the patch: one was found by decoding a register dump off a photograph, the other
+by a QEMU exception log. Cheap to find once measured, expensive while guessed.
+
+**Two guards added, because the pattern recurred:**
+
+- `tests/test-0094-callee-saved.py` asserts the *rule*: whatever register holds `lr`
+  across the call must be callee-saved (x19-x28), the save and restore must agree, and the
+  macro must actually call the console. Mutation-checked -- putting x16 back makes it fail.
+- QEMU is now a gate, not a courtesy. If Data Aborts are non-zero or IRQs are zero, the
+  image is not flashed.
+
+**Also fixed:** the macro's comment still claimed `lr` was saved in x16 while the code used
+x28.
+
+**Still not explained:** why the phone hangs in `common_start`. The next boot should print
+`SWEET EARLY 21..25`, and the first missing number answers that -- if 23 appears and 24 does
+not, the MMU enable is the culprit.
+
 ### >>> UPDATE 2026-10-21 #25: staged colour bands, because the panel is the only output <<<
 
 **What the 0091 fix produced on hardware: no PANIC, no band, then a watchdog reset.**

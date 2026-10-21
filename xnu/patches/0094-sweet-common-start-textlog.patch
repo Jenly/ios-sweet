@@ -1,7 +1,7 @@
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -535,6 +535,31 @@
+@@ -535,6 +535,33 @@
  .endm
  #endif
  
@@ -18,7 +18,9 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 + * only touches registers the callers have proven dead:
 + *   x0, x1  - call arguments, dead at every insertion point
 + *   x16/x17 - intra-procedure scratch, which cannot hold live values across a call
-+ *   lr      - saved in x16 and restored, since callers return through it
++ *   x28     - callee-saved, so it holds lr across the call to sweet_early_mark
++ *             (x16/x17 must NOT be used: they are caller-saved scratch and came back
++ *             clobbered, which put the return address into __BOOTDATA and faulted)
 + */
 +.macro SWEET_LOG_MARK stage, label
 +	mov		x28, lr
@@ -33,7 +35,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
  /*
   * _start_first_cpu
   * Cold boot init routine.  Called from __start
-@@ -805,6 +830,8 @@
+@@ -805,6 +832,8 @@
   */
  common_start:
  
@@ -42,7 +44,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
  #if HAS_NEX_PG
  	mov x19, lr
  	bl		EXT(set_nex_pg)
-@@ -879,6 +906,7 @@
+@@ -879,6 +908,7 @@
  	ic		iallu
  #endif
  
@@ -50,7 +52,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
  #if defined(SWEET)
  	/* Complete local TLB/I-cache invalidation before enabling the MMU. */
  	dsb		sy
-@@ -913,6 +941,7 @@
+@@ -913,6 +943,7 @@
  	sub		x0, x0, x23
  1:
  	MSR_VBAR_EL1_X0
@@ -58,7 +60,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
  
  #if HAS_APPLE_PAC
  	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
-@@ -923,6 +952,8 @@
+@@ -923,6 +954,8 @@
  	MSR_SCTLR_EL1_X0
  	isb		sy
  
@@ -67,7 +69,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
  #if !VMAPPLE && !defined(SWEET)
  	MOV64   x1, SCTLR_EL1_DEFAULT
  	cmp		x0, x1
-@@ -985,6 +1016,7 @@
+@@ -985,6 +1018,7 @@
  	mov	lr, x21
  #endif
  
@@ -75,7 +77,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
  	// Return to arm_init()
  	ret
  
-@@ -1047,4 +1079,26 @@
+@@ -1047,4 +1081,26 @@
  
  //#include	"globals_asm.h"
  
