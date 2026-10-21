@@ -2,6 +2,79 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-21 #24: 0091 crashed the kernel it was meant to observe <<<
+
+**The phone's PANIC SYNC dump, read off a photograph at native resolution** (the earlier
+reading of the same photo as `MARKER MISS!` was a low-resolution misread and is withdrawn):
+
+```
+PANIC    SYNC
+SLOT     n=00000004  cpu=00000000
+STAGE    loader
+ESR      0000000096000021
+ELR      00000001014920EC
+FAR      000005357454834
+SPSR     00000000600003C5
+X0       00000001024D4000
+X1       00000000400B5000
+X30      0000000400B2A38
+```
+
+| field | value | meaning |
+|---|---|---|
+| ESR | `0x96000021` | EC=0x25 Data Abort (same EL), DFSC=0x21 **alignment fault**, WnR=0 read |
+| ELR | `0x1014920EC` | kernel VA `0xfffffe00074920ec` = `_start` + **0x1c64** |
+| FAR | `0x5357454834` | not 8-byte aligned (ends in 4) |
+| X0 | `0x1024D4000` | the real `boot_args` physical address |
+
+`_start` is literally `b start_first_cpu` (`start.s:222`), so ELR is
+`start_first_cpu`'s **first instruction** -- the one 0091 inserted.
+
+**Root cause.** Apple's comment above `start_first_cpu` says `x0 - Boot args`; `mov x20,
+x0` happens *inside* the function, two instructions later. 0091 was inserted at
+`LEXT(start_first_cpu)`, i.e. **before** that `mov`, so its first instruction ran with a
+stale `x20`. The fault identifies the stale value exactly:
+
+```
+FAR - BA_MARKER_PA = 0x5357454834 - 0x2e0 = 0x5357454554 = marker_magic ("SWEET")
+```
+
+`x20` still held `marker_magic`, which the shim had just written into `boot_args` and which
+survives because `x20` is callee-saved. `x20 + 0x2e0` is not 8-aligned -> alignment fault.
+The probe therefore proved the kernel executed *by crashing inside the probe*, never
+reaching the code it was supposed to measure -- and the crash looked like the kernel
+hanging even earlier than before.
+
+**The fix.** Move the block after `mov x20, x0`. Regenerated the patch by diffing base
+(`0001-0090`) against the corrected tree so the offsets are right by construction, and kept
+the two `mov`s as leading context so the hunk itself records the ordering it depends on.
+It applies with **zero fuzz** and reproduces the target byte for byte.
+
+Assembled the prologue to confirm the encoding before spending a CI run:
+
+```
+c: aa0003f4   mov x20, x0
+14: f9417289  ldr x9, [x20, #0x2e0]     <- x20 is boot_args here now
+```
+
+`aa0003f4` is the same word the dump shows at `0xfffffe0007492108`, which also confirms the
+dump was of this image.
+
+**Regression test** `tests/test-0091-marker-order.py`, 8 checks: the ordering in the tree,
+that the `mov` is `start_first_cpu`'s (not another function's), that `DAIFSet` also precedes
+the marker, and that the patch's own context carries the `mov`. Mutation check: moving the
+block back to `LEXT(start_first_cpu)` makes it fail, so it catches the bug it was written
+for. Same class of protection as `xnu-hdrcheck.py` -- a test that models the mechanism
+rather than grepping for a symbol.
+
+**Also corrected:** an earlier claim in this session that `boot-marker91.img`'s payload
+differed from `kernel-P0091.sweet`. All ten segments are byte-identical; the comparison that
+said otherwise had compared equal file offsets rather than segment contents.
+
+**Not yet re-tested on hardware.** Next: CI run, then `fastboot boot` and a photograph of
+the panel. With the fix, either the white stage-0 band appears (kernel running past the
+marker) or a different ESR/ELR pair does -- but no longer this one.
+
 ### >>> UPDATE 2026-10-21 #23: QEMU clears chiron's parameters; a marker to end the guessing <<<
 
 **The board parameters are correct.** After an ADT bisection that went wrong and had to be
