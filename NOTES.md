@@ -67,6 +67,68 @@ check searched for `movk` with the wrong mask, reported all five missing, and wa
 the bands had been there all along. Both are the same failure mode: trusting a check whose
 negative result was not itself verified.
 
+### >>> UPDATE 2026-10-22 #27: text checkpoints, and what the bands actually proved <<<
+
+**The bands were the wrong instrument, and they had a defect.** They produced five
+coloured blocks and zero information about *why* the boot stops. Worse, they were painted
+at y 800..971 while the shim's console occupies rows 24..887 (MARGIN=24, CH_H=48, 18
+lines), so they overwrote the `JUMP` and `XNU` lines. The "cyan square next to _XNU" in
+the photograph was our band, not a decoration.
+
+**What they did establish, which is worth keeping.** All five bands appeared, and the
+band addresses were confirmed by disassembling the built kernel rather than by trusting
+the source:
+
+```
+0xfffffe0007492120  white    CP1 marker store
+0xfffffe000749218c  green    CP2 stage-0 band
+0xfffffe00074921d8  red      CP3 own VBAR
+0xfffffe0007492404  yellow   CP4 page tables
+0xfffffe000749246c  magenta  CP5 -> common_start
+```
+
+So the kernel completes `start_first_cpu`, both bootstrap mappings and the pre-MMU
+framebuffer mapping, and branches into `common_start`.
+
+**The observation that actually localises the fault.** `arm_init.c` already contains
+twelve `sweet_early_mark(n, "...")` calls, and `sweet_early_mark()` draws a block *and
+prints a text line* through `iso_font`. None of those lines has ever appeared on the
+phone. `arm_init`'s very first statement is `sweet_early_mark(1, "arm_init entered (MMU
+on)")`. So the kernel does not reach `arm_init` at all: the window is `common_start`
+itself -- the MMU enable and the return.
+
+**0094 therefore prints text from inside that window.** It calls the console that already
+exists instead of inventing one:
+
+| mark | label | position |
+|---|---|---|
+| 21 | in common_start | entry |
+| 22 | TCR/TTBR/MAIR set | after the registers are programmed, before the MMU bit |
+| 23 | exception vectors set | after the VBAR install, still MMU off |
+| 24 | MMU enabled | immediately after `MSR_SCTLR_EL1_X0` |
+| 25 | returning to arm_init | before `ret` |
+
+Numbering continues `arm_init`'s 1..20 so the panel reads as one sequence. CP24 is the
+boundary: 23 present and 24 absent means the fault is in enabling the MMU, or in the first
+instruction fetched through the new translation.
+
+The macro saves `lr` in `x16` and restores it, and touches only `x0`/`x1`/`x16`. `x20`,
+`x22`, `x23`, `x25` (boot_args, virtBase, physBase, pagetables) survive because
+`sweet_early_mark` is an ordinary C function.
+
+**Two build traps, both recorded because they cost real time:**
+
+1. `EXT()` is a **C preprocessor** macro (`#define EXT(x) _ ## x`), not an assembler
+   macro. Defining `.macro EXT` to test the stub fails with *unexpected token in argument
+   list*. The working check runs `cpp` first, then the assembler, and confirms the
+   encoding plus the BRANCH26 / PAGE21 / PAGEOFF12 relocations.
+
+2. The mark inside the VBAR block was first numbered 24 and the MMU one 23, which reads
+   backwards on the panel. Renumbered to execution order.
+
+**Not yet on hardware.** Next: CI, then `fastboot boot`; the panel should show
+`SWEET EARLY 21: in common_start` and suite. The first missing number is the answer.
+
 ### >>> UPDATE 2026-10-21 #25: staged colour bands, because the panel is the only output <<<
 
 **What the 0091 fix produced on hardware: no PANIC, no band, then a watchdog reset.**
