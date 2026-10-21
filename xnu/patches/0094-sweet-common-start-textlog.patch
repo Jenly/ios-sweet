@@ -50,16 +50,15 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
  #if defined(SWEET)
  	/* Complete local TLB/I-cache invalidation before enabling the MMU. */
  	dsb		sy
-@@ -914,6 +942,8 @@
+@@ -913,6 +941,7 @@
+ 	sub		x0, x0, x23
  1:
  	MSR_VBAR_EL1_X0
- 
 +	SWEET_LOG_MARK 23, Lsweet_log23
-+
+ 
  #if HAS_APPLE_PAC
  	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
- #endif /* HAS_APPLE_PAC */
-@@ -923,6 +953,8 @@
+@@ -923,6 +952,8 @@
  	MSR_SCTLR_EL1_X0
  	isb		sy
  
@@ -68,7 +67,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
  #if !VMAPPLE && !defined(SWEET)
  	MOV64   x1, SCTLR_EL1_DEFAULT
  	cmp		x0, x1
-@@ -985,6 +1017,7 @@
+@@ -985,6 +1016,7 @@
  	mov	lr, x21
  #endif
  
@@ -76,7 +75,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
  	// Return to arm_init()
  	ret
  
-@@ -1047,4 +1080,26 @@
+@@ -1047,4 +1079,26 @@
  
  //#include	"globals_asm.h"
  

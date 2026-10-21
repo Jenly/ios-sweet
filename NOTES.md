@@ -129,6 +129,55 @@ The macro saves `lr` in `x16` and restores it, and touches only `x0`/`x1`/`x16`.
 **Not yet on hardware.** Next: CI, then `fastboot boot`; the panel should show
 `SWEET EARLY 21: in common_start` and suite. The first missing number is the answer.
 
+### >>> UPDATE 2026-10-22 #28: CI said success and shipped a kernel without the probe <<<
+
+**The failure mode is worth recording on its own.** CI run `39641560752` went green, and the
+artifact contained none of the five log strings. The build log:
+
+```
+[warning] Skipping patch .../0094-sweet-common-start-textlog.patch
+          (already upstream, previously applied, or malformed):
+          error: patch failed: osfmk/arm64/start.s:805
+          error: osfmk/arm64/start.s: patch does not apply
+```
+
+A skipped patch is a **warning**, not an error, so the build continued and produced a
+kernel with none of the instrumentation -- and a green check next to it.
+
+**Cause.** 0093 and 0094 both insert at `common_start:` and at the pre-MMU site. CI applies
+0093 first; 0094 was generated against 0001-0092 (without 0093), so its context no longer
+matched.
+
+**Why my local check passed.** It applied 0094 onto 0001-0092, where the context still
+matched. A verification whose base differs from the real pipeline is worse than no
+verification: it reports success for precisely the thing that breaks. Also verified the
+patch itself was fine -- forward apply of all seven hunks is clean and the reverse dry-run
+fails as it should, so nothing was malformed.
+
+**Changes.**
+
+- **0093 deleted.** It painted colour bands in `common_start`; 0094 prints text there.
+  Two probes writing the same screen region, one saying strictly less, is not a feature.
+- **0094 regenerated against 0001-0092**, which is what CI actually has.
+- **New pre-commit check:** apply 0090, 0091, 0092, 0094 in order to a real tree, confirm
+  every one lands, and confirm the result is byte-identical to the working tree. This
+  replaces the single-patch apply test, which is what let the ordering bug through.
+
+**What the next boot should show.** `sweet_early_mark()` prints a line per stage, and
+`arm_init` already calls it twelve times (1..20). The new marks continue that numbering:
+
+```
+SWEET EARLY 21: in common_start
+SWEET EARLY 22: TCR/TTBR/MAIR set
+SWEET EARLY 23: exception vectors set
+SWEET EARLY 24: MMU enabled
+SWEET EARLY 25: returning to arm_init
+```
+
+The first number missing from the panel is the answer. If 23 appears and 24 does not, the
+fault is in enabling the MMU or in the first instruction fetched through the new
+translation -- which is a concrete, arguable hypothesis instead of a colour.
+
 ### >>> UPDATE 2026-10-21 #25: staged colour bands, because the panel is the only output <<<
 
 **What the 0091 fix produced on hardware: no PANIC, no band, then a watchdog reset.**
