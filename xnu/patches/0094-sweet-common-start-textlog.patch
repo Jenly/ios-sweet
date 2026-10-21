@@ -21,12 +21,12 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 + *   lr      - saved in x16 and restored, since callers return through it
 + */
 +.macro SWEET_LOG_MARK stage, label
-+	mov		x16, lr
++	mov		x28, lr
 +	mov		x0, #\stage
 +	adrp	x1, \label@page
 +	add		x1, x1, \label@pageoff
 +	bl		EXT(sweet_early_mark)
-+	mov		lr, x16
++	mov		lr, x28
 +.endm
 +#endif
 +
