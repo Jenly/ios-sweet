@@ -1,0 +1,58 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 53099ee..511fe75 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -848,8 +848,6 @@ Lkernelcache_base_found:
+  */
+ common_start:
+ 
+-	SWEET_LOG_MARK 21, Lsweet_log21
+-
+ #if HAS_NEX_PG
+ 	mov x19, lr
+ 	bl		EXT(set_nex_pg)
+@@ -859,18 +857,6 @@ common_start:
+ 	// Set the translation control register.
+ 	adrp	x0,     EXT(sysreg_restore)@page		// Load TCR value from the system register restore structure
+ 	add		x0, x0, EXT(sysreg_restore)@pageoff
+-#if defined(SWEET)
+-	/*
+-	 * SWEET boots either from the shim's identity MMU (TTBR0 only -- no
+-	 * TTBR1 covers the kernel KVA) or with the MMU still off (QEMU gate
+-	 * stub). sysreg_restore lives at a kernel KVA that neither environment
+-	 * can translate, so read it through the V=P window instead: the shim
+-	 * and the stub both keep the kernel image in RAM reachable by PA.
+-	 * The KVA->PA form is the inverse of the PA->KVA adds below.
+-	 */
+-	sub		x0, x0, x22
+-	add		x0, x0, x23
+-#endif
+ 	ldr		x1, [x0, SR_RESTORE_TCR_EL1]
+ 	MSR_TCR_EL1_X1
+ 
+@@ -936,7 +922,6 @@ common_start:
+ 	ic		iallu
+ #endif
+ 
+-	SWEET_LOG_MARK 22, Lsweet_log22
+ #if defined(SWEET)
+ 	/* Complete local TLB/I-cache invalidation before enabling the MMU. */
+ 	dsb		sy
+@@ -971,7 +956,6 @@ common_start:
+ 	sub		x0, x0, x23
+ 1:
+ 	MSR_VBAR_EL1_X0
+-	SWEET_LOG_MARK 23, Lsweet_log23
+ 
+ #if HAS_APPLE_PAC
+ 	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
+@@ -982,6 +966,9 @@ common_start:
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
++	SWEET_LOG_MARK 21, Lsweet_log21
++	SWEET_LOG_MARK 22, Lsweet_log22
++	SWEET_LOG_MARK 23, Lsweet_log23
+ 	SWEET_LOG_MARK 24, Lsweet_log24
+ 
+ #if !VMAPPLE && !defined(SWEET)
