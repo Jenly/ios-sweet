@@ -1,0 +1,22 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -642,6 +859,18 @@ common_start:
+ 	// Set the translation control register.
+ 	adrp	x0,     EXT(sysreg_restore)@page		// Load TCR value from the system register restore structure
+ 	add		x0, x0, EXT(sysreg_restore)@pageoff
++#if defined(SWEET)
++	/*
++	 * SWEET boots either from the shim's identity MMU (TTBR0 only -- no
++	 * TTBR1 covers the kernel KVA) or with the MMU still off (QEMU gate
++	 * stub). sysreg_restore lives at a kernel KVA that neither environment
++	 * can translate, so read it through the V=P window instead: the shim
++	 * and the stub both keep the kernel image in RAM reachable by PA.
++	 * The KVA->PA form is the inverse of the PA->KVA adds below.
++	 */
++	sub		x0, x0, x22
++	add		x0, x0, x23
++#endif
+ 	ldr		x1, [x0, SR_RESTORE_TCR_EL1]
+ 	MSR_TCR_EL1_X1
+ 
