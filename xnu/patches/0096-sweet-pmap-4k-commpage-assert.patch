@@ -1,0 +1,19 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..885ccb3 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10984,8 +10984,14 @@ static_assert((_COMM_PAGE32_BASE_ADDRESS & ~ARM_TT_L2_OFFMASK) >= VM_MAX_ADDRESS
+ /**
+  * Ensure that 64-bit devices using 4K pages can nest the commpage completely
+  * above the maximum userspace VA.
++ *
++ * As with the 16K branch above, this does not hold on macOS (or on SWEET,
++ * which masquerades as macOS): the commpage lives within the userspace VA
++ * range, but is protected by the VM as a reserved region.
+  */
++#if !defined(XNU_PLATFORM_MacOSX) && !defined(XNU_PLATFORM_DriverKit)
+ static_assert((_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK) >= MACH_VM_MAX_ADDRESS);
++#endif
+ #else
+ #error Nested shared page mapping is unsupported on this config
+ #endif
