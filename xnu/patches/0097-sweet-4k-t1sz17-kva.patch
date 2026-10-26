@@ -1,0 +1,171 @@
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index 75f3db0..af5b0af 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -112,7 +112,11 @@
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
+ #else /* defined(ARM_LARGE_MEMORY) */
+-#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
++/*
++ * SWEET 4K with T1SZ=17 (0097): V=P L1 + KVA L0 + KVA L1 + up to 3xL2
++ * pages for each of V=P and KVA = 9 pages; keep 12 for slide headroom.
++ */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 12)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+ 
+ typedef uint64_t tt_entry_t; /* translation table entry type */
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 45a4464..f9f76a3 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1845,9 +1845,17 @@ sweet_early_map_final(void)
+ {
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+ 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+-	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+-	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+-	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++	/*
++	 * With T1SZ=17 (4K granule, SWEET 0097) the kernel pmap root is an
++	 * L0 table, so descend L0 -> L1 -> L2 instead of assuming L1 is the
++	 * root.
++	 */
++	tt_entry_t l0 = cpu_tte[(va & ARM_TT_L0_INDEX_MASK) >> ARM_TT_L0_SHIFT];
++	assert((l0 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
++	tt_entry_t *l1 = (tt_entry_t *)phystokv(l0 & ARM_TTE_TABLE_MASK);
++	tt_entry_t l1e = l1[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++	assert((l1e & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
++	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1e & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+ 	*slot = (tt_entry_t)sweet_fb_pa | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+@@ -1990,8 +1998,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 * hold our bootstrap mappings for any possible slide */
+ 	size_t bytes_mapped = dynamic_memory_begin - gVirtBase;
+ 	size_t l1_entries = 1 + ((bytes_mapped + ARM_TT_L1_SIZE - 1) / ARM_TT_L1_SIZE);
+-	/* 1 L1 each for V=P and KVA, plus 1 page for each L2 */
+-	size_t pages_used = 2 * (l1_entries + 1);
++	/* 1 L1 each for V=P and KVA, plus 1 page for each L2, plus 1 KVA L0
++	 * root (T1SZ=17, 4K granule). */
++	size_t pages_used = 2 * (l1_entries + 1) + 1;
+ 	if (pages_used > BOOTSTRAP_TABLE_SIZE) {
+ 		panic("BOOTSTRAP_TABLE_SIZE too small for memory config");
+ 	}
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index e01c124..73fedad 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -971,7 +971,15 @@
+ #if __ARM64_PMAP_SUBPAGE_L1__
+ #define T1SZ_BOOT 26ULL
+ #else /* __ARM64_PMAP_SUBPAGE_L1__ */
+-#define T1SZ_BOOT 25ULL
++/*
++ * SWEET (0097): the kernel's KVA lives in the 0xfffffe0000000000 region,
++ * mirroring the 16K Apple layout.  A 4K granule would otherwise default to
++ * T1SZ=25, whose TTBR1 window starts at 0xffffff8000000000 and leaves the
++ * whole KVA untranslatable (Address size fault on the first stack frame).
++ * T1SZ=17 widens TTBR1 to 128TB so KVA works, at the cost of a 4-level
++ * table (bootstrap start.s installs the extra L0 root for it).
++ */
++#define T1SZ_BOOT 17ULL
+ #endif /*__ARM64_PMAP_SUBPAGE_L1__*/
+ #endif /* __ARM_16K_PG__ */
+ #endif /* defined(APPLE_ARM64_ARCH_FAMILY) */
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index b0fd08b..80d2d5a 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -692,18 +692,17 @@ Lsweet_mark_pixel:
+ 	/*
+ 	 * Set up the bootstrap page tables with a single block entry for the V=P
+ 	 * mapping, a single block entry for the trampolined kernel address (KVA),
+-	 * and all else invalid. This requires four pages:
+-	 *	Page 1 - V=P L1 table
+-	 *	Page 2 - V=P L2 table
++	 * and all else invalid. With T1SZ=17 the KVA TTBR1 root is an L0 table:
++	 *	Page 1 - V=P L1 table  (TTBR0 root, T0SZ=25)
++	 *	Page 2 - KVA L0 table  (TTBR1 root, T1SZ=17)
+ 	 *	Page 3 - KVA L1 table
+-	 *	Page 4 - KVA L2 table
++	 *	Page 4 - L2 tables (V=P first, then KVA)
+ 	 */
+ 
+ 	// Invalidate all entries in the bootstrap page tables
+ 	mov		x0, #(ARM_TTE_EMPTY)				// Load invalid entry template
+ 	mov		x1, x25								// Start at V=P pagetable root
+-	mov		x2, #(TTE_PGENTRIES)				// Load number of entries per page
+-	lsl		x2, x2, #2							// Shift by 2 for num entries on 4 pages
++	mov		x2, #(TTE_PGENTRIES * 12)			// entries across all 12 bootstrap pages
+ 
+ Linvalidate_bootstrap:							// do {
+ 	str		x0, [x1], #(1 << TTE_SHIFT)			//   Invalidate and advance
+@@ -763,17 +762,17 @@ Lkernelcache_base_found:
+ 
+ 	/*
+ 	 * Allocate L1 tables
+-	 * x1 - V=P L1 page
+-	 * x3 - KVA L1 page
++	 * x1 - V=P L1 page (page 1)
++	 * x3 - KVA L1 page (page 3; page 2 is the KVA L0 root for T1SZ=17)
+ 	 * x2 - free mem pointer from which we allocate a variable number of L2
+ 	 * pages. The maximum number of bootstrap page table pages is limited to
+-	 * BOOTSTRAP_TABLE_SIZE. For a 2G 4k page device, assuming the worst-case
+-	 * slide, we need 1xL1 and up to 3xL2 pages (1GB mapped per L1 entry), so
+-	 * 8 total pages for V=P and KVA.
++	 * BOOTSTRAP_TABLE_SIZE. For a 3G 4k page device with T1SZ=17 (SWEET),
++	 * we need V=P L1 + KVA L0 + KVA L1 + up to 3xL2 pages for each of V=P
++	 * and KVA, so 9 total pages (BOOTSTRAP_TABLE_SIZE is 12 for headroom).
+ 	 */
+ 	mov		x1, x25
+-	add		x3, x1, PGBYTES
+-	mov		x2, x3
++	add		x3, x1, #(2 * PGBYTES)				// KVA L1 table = page 3
++	add		x2, x3, PGBYTES						// free pointer starts at page 4
+ 
+ 	/*
+ 	 * Setup the V=P bootstrap mapping
+@@ -783,6 +782,21 @@ Lkernelcache_base_found:
+ 	/* create_bootstrap_mapping(vbase, pbase, num_ents, L1 table, freeptr) */
+ 	create_bootstrap_mapping x0,  x4,  x5, x1, x2, x6, x10, x11, x12, x13
+ 
++	/*
++	 * KVA TTBR1 root: with T1SZ=17 the root is an L0 table.  Wire
++	 * L0[VA[47:39]] of the kernel's KVA base to the KVA L1 table.
++	 */
++	mov		x9, x1
++	add		x9, x9, PGBYTES						/* KVA L0 table = page 2 */
++	mov		x10, #(ARM_TTE_BOOT_TABLE)
++	and		x11, x14, #(ARM_TT_L0_INDEX_MASK)
++	lsr		x11, x11, #(ARM_TT_L0_SHIFT)
++	lsl		x11, x11, #(TTE_SHIFT)
++	add		x11, x9, x11
++	and		x12, x3, #(ARM_TTE_TABLE_MASK)
++	orr		x12, x10, x12
++	str		x12, [x11]
++
+ 	/* Setup the KVA bootstrap mapping */
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+@@ -794,15 +808,17 @@ Lkernelcache_base_found:
+ 	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+ 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+ 	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+-	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * SWEET uses 4K pages with T1SZ=17 (0097): page 2 is the KVA L0 root
++	 * and page 3 the KVA L1 table; the free pointer starts at page 4 and
++	 * create_bootstrap_mapping consumes the first page for the V=P L2
++	 * table, so the fb block lands in bootstrap_pagetables + 4*PGBYTES.
+ 	 */
+ 	ldr		x10, [x20, BA_VIDEO_BASE]
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+-	add		x13, x25, #(2 * PGBYTES)
++	add		x13, x25, #(4 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
+ #endif
+ 
