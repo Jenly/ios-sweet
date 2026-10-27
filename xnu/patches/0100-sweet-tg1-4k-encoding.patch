@@ -1,0 +1,15 @@
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index 73fedad..83c31eb 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -858,8 +858,8 @@
+ #define TCR_TG1_GRANULE_SHIFT    30ULL
+ 
+ #define TCR_TG1_GRANULE_16KB     (1ULL << TCR_TG1_GRANULE_SHIFT)
+-#define TCR_TG1_GRANULE_4KB      (2ULL << TCR_TG1_GRANULE_SHIFT)
+-#define TCR_TG1_GRANULE_64KB     (3ULL << TCR_TG1_GRANULE_SHIFT)
++#define TCR_TG1_GRANULE_4KB      (3ULL << TCR_TG1_GRANULE_SHIFT)
++#define TCR_TG1_GRANULE_64KB     (2ULL << TCR_TG1_GRANULE_SHIFT)
+ 
+ #if __ARM_16K_PG__
+ #define TCR_TG1_GRANULE_SIZE     (TCR_TG1_GRANULE_16KB)
