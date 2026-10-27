@@ -1,0 +1,46 @@
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index 83c31eb..73fedad 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -858,8 +858,8 @@
+ #define TCR_TG1_GRANULE_SHIFT    30ULL
+ 
+ #define TCR_TG1_GRANULE_16KB     (1ULL << TCR_TG1_GRANULE_SHIFT)
+-#define TCR_TG1_GRANULE_4KB      (3ULL << TCR_TG1_GRANULE_SHIFT)
+-#define TCR_TG1_GRANULE_64KB     (2ULL << TCR_TG1_GRANULE_SHIFT)
++#define TCR_TG1_GRANULE_4KB      (2ULL << TCR_TG1_GRANULE_SHIFT)
++#define TCR_TG1_GRANULE_64KB     (3ULL << TCR_TG1_GRANULE_SHIFT)
+ 
+ #if __ARM_16K_PG__
+ #define TCR_TG1_GRANULE_SIZE     (TCR_TG1_GRANULE_16KB)
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 511fe75..146c92e 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -966,11 +966,17 @@ common_start:
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
++	SWEET_STAGE 6, 0xFF00FFFF	/* cyan: MMU enabled, V=P map live */
++	dsb		sy
++
+ 	SWEET_LOG_MARK 21, Lsweet_log21
+ 	SWEET_LOG_MARK 22, Lsweet_log22
+ 	SWEET_LOG_MARK 23, Lsweet_log23
+ 	SWEET_LOG_MARK 24, Lsweet_log24
+ 
++	SWEET_STAGE 7, 0xFF808080	/* gray: log marks 21-24 done (KVA stack OK) */
++	dsb		sy
++
+ #if !VMAPPLE && !defined(SWEET)
+ 	MOV64   x1, SCTLR_EL1_DEFAULT
+ 	cmp		x0, x1
+@@ -1034,6 +1040,8 @@ common_start:
+ #endif
+ 
+ 	SWEET_LOG_MARK 25, Lsweet_log25
++	SWEET_STAGE 8, 0xFF0000FF	/* blue: leaving common_start, ret to arm_init */
++	dsb		sy
+ 	// Return to arm_init()
+ 	ret
+ 
