@@ -1,0 +1,35 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index db7877d..77334ec 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -509,8 +509,8 @@ start_cpu:
+  * has set up its own, and a probe that clobbers a live register produces exactly the
+  * class of bug that 0091 shipped with.
+  *
+- * MMU is off at all five sites, so every access is Device memory and the write is a
+- * plain physical store to the framebuffer that boot_args names.
++ * MMU is off at the first five sites and on (V=P, Normal-NC block) at 6-8,
++ * so every access is a plain store to the framebuffer that boot_args names.
+  */
+ .macro SWEET_STAGE idx, colour
+ 	ldr		x9, [x20, BA_VIDEO_BASE]
+@@ -522,14 +522,14 @@ start_cpu:
+ 	movz	x12, #((\colour >> 0) & 0xFFFF)
+ 	movk	x12, #((\colour >> 16) & 0xFFFF), lsl #16
+ 	mov		x13, #12
++	lsr		x11, x10, #2			/* pixels per row = row_bytes / 4 */
+ Lsweet_stage_row\@:
+-	mov		x11, #16
+-Lsweet_stage_px\@:
+ 	str		w12, [x9], #4
+ 	subs	x11, x11, #1
+-	b.ne	Lsweet_stage_px\@
+-	add		x9, x9, x10
+-	sub		x9, x9, #64
++	b.ne	Lsweet_stage_row\@
++	/* x9 is now at the start of the next row: the row loop wrote exactly
++	 * row_bytes bytes, so it lands on the next line with no adjustment. */
++	lsr		x11, x10, #2
+ 	subs	x13, x13, #1
+ 	b.ne	Lsweet_stage_row\@
+ .endm

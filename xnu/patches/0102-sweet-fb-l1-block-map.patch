@@ -1,38 +1,41 @@
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index a17088f..867642a 100644
+index 146c92e..db7877d 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -791,19 +791,22 @@ Lkernelcache_base_found:
+@@ -805,21 +805,23 @@ Lkernelcache_base_found:
  
  #if defined(SWEET)
  	/*
 -	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
 -	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
 -	 * create_bootstrap_mapping would replace the RAM L2 table.
--	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
--	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+-	 * SWEET uses 4K pages with T1SZ=17 (0097): page 2 is the KVA L0 root
+-	 * and page 3 the KVA L1 table; the free pointer starts at page 4 and
+-	 * create_bootstrap_mapping consumes the first page for the V=P L2
+-	 * table, so the fb block lands in bootstrap_pagetables + 4*PGBYTES.
 +	 * Splash framebuffer: map the physical framebuffer so the post-MMU
 +	 * stage bands can write it.  chiron's fb (0x9d400000) sits in the
-+	 * 0x80000000..0xC0000000 1GiB window (V=P L1 index 2), below the RAM
-+	 * mapping that create_bootstrap_mapping placed at L1 index 4+.  The
-+	 * old code wrote the entry into the RAM L2 table at the fb's L2 index,
-+	 * which left the fb unmapped once the MMU came on (the stage-6 band
-+	 * faulted on its first store).  A 1GiB L1 block costs nothing extra in
-+	 * the bootstrap tables, which are already at BOOTSTRAP_TABLE_SIZE.
++	 * 0x80000000..0xC0000000 1GiB window (V=P L1 index 2), which has no
++	 * RAM mapping (chiron RAM is at L1 index 4+); the old code wrote the
++	 * fb entry into the V=P L2 table (page 4) at the fb's L2 index, which
++	 * maps a block at the wrong PA and leaves the fb itself unmapped once
++	 * the MMU comes on (the stage-6 band faults on its first store).  A
++	 * 1GiB L1 block in the V=P L1 table (TTBR0 root, x25) costs nothing
++	 * extra: the bootstrap tables are already at BOOTSTRAP_TABLE_SIZE.
  	 */
  	ldr		x10, [x20, BA_VIDEO_BASE]
 -	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
 -	orr		x11, x11, x10
 -	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
 -	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
--	add		x13, x25, #(2 * PGBYTES)
+-	add		x13, x25, #(4 * PGBYTES)
 -	str		x11, [x13, x12, lsl #TTE_SHIFT]
-+	ubfx	x11, x10, #ARM_TT_L1_SHIFT, #9		// L1 index of the 1GiB block
-+	and		x12, x10, #(ARM_TT_L1_SIZE - 1)	// fb offset within the block
-+	sub		x12, x10, x12					// 1GiB-aligned block base
++	ubfx	x11, x10, #ARM_TT_L1_SHIFT, #9		/* L1 index of the 1GiB window */
++	and		x12, x10, #(ARM_TT_L1_SIZE - 1)		/* fb offset within the block */
++	sub		x12, x10, x12						/* 1GiB-aligned block base (PA) */
 +	MOV64	x13, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
 +	orr		x13, x13, x12
-+	str		x13, [x25, x11, lsl #TTE_SHIFT]
++	str		x13, [x25, x11, lsl #TTE_SHIFT]		/* V=P L1 (TTBR0 root) slot */
  #endif
  
  	/* Ensure TTEs are visible */
