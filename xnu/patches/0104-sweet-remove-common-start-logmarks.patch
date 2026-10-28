@@ -1,0 +1,26 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 77334ec..bf85b95 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -971,12 +971,7 @@ common_start:
+ 	SWEET_STAGE 6, 0xFF00FFFF	/* cyan: MMU enabled, V=P map live */
+ 	dsb		sy
+ 
+-	SWEET_LOG_MARK 21, Lsweet_log21
+-	SWEET_LOG_MARK 22, Lsweet_log22
+-	SWEET_LOG_MARK 23, Lsweet_log23
+-	SWEET_LOG_MARK 24, Lsweet_log24
+-
+-	SWEET_STAGE 7, 0xFF808080	/* gray: log marks 21-24 done (KVA stack OK) */
++	SWEET_STAGE 7, 0xFF808080	/* gray: log marks removed (KVA string fetch was the death point) */
+ 	dsb		sy
+ 
+ #if !VMAPPLE && !defined(SWEET)
+@@ -1041,7 +1036,6 @@ common_start:
+ 	mov	lr, x21
+ #endif
+ 
+-	SWEET_LOG_MARK 25, Lsweet_log25
+ 	SWEET_STAGE 8, 0xFF0000FF	/* blue: leaving common_start, ret to arm_init */
+ 	dsb		sy
+ 	// Return to arm_init()
