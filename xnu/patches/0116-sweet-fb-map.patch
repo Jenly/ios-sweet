@@ -1,0 +1,43 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 60951a6..48a89b1 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1854,7 +1854,17 @@ static void
+ sweet_early_map_final(void)
+ {
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+-	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
++	/*
++	 * The alias must cover the whole panel: 1080x2160x4 = 8.9 MiB, and
++	 * sweet_early_mark() writes its bottom stage bands at an offset of
++	 * roughly stride*(height-32)*4 ~ 9.2 MiB while the console can run
++	 * to the bottom row (~9.3 MiB).  A single L2 block (2 MiB) left the
++	 * bands past the mapping and took a Data Abort (0115 gate), so map
++	 * 5 x 2 MiB blocks (10 MiB) instead (0116).
++	 */
++	const int fb_blocks = 5;
++	int i;
++	assert(va + fb_blocks * ARM_TT_L2_SIZE <= gVirtBase);
+ 	/*
+ 	 * With T1SZ=17 (4K granule, SWEET 0097) the kernel pmap root is an
+ 	 * L0 table, so descend L0 -> L1 -> L2 instead of assuming L1 is the
+@@ -1867,11 +1877,14 @@ sweet_early_map_final(void)
+ 	assert((l1e & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1e & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+-	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = (tt_entry_t)sweet_fb_pa | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+-	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+-	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	for (i = 0; i < fb_blocks; i++) {
++		assert(slot[i] == ARM_TTE_EMPTY);
++		slot[i] = (tt_entry_t)(sweet_fb_pa + i * ARM_TT_L2_SIZE) | ARM_TTE_VALID |
++		    ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif
