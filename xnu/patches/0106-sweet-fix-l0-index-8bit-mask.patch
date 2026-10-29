@@ -1,0 +1,13 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 6993517..41cb7a1 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -794,7 +794,7 @@ Lkernelcache_base_found:
+ 	mov		x10, #(ARM_TTE_BOOT_TABLE)
+ 	and		x11, x14, #(ARM_TT_L0_INDEX_MASK)
+ 	lsr		x11, x11, #(ARM_TT_L0_SHIFT)
+-	and		x11, x11, #0x7F					/* T1SZ=17: L0 index is 8 bits */
++	and		x11, x11, #0xFF					/* T1SZ=17: L0 index is 8 bits (keep VA[46:39]) */
+ 	lsl		x11, x11, #(TTE_SHIFT)
+ 	add		x11, x9, x11
+ 	and		x12, x3, #(ARM_TTE_TABLE_MASK)
