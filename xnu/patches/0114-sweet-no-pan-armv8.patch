@@ -1,0 +1,19 @@
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index ee2430b..20db9c6 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -34,7 +34,13 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+-#define __ARM_PAN_AVAILABLE__     1
++/*
++ * chiron (Mi MIX 2, Snapdragon 835 / Kryo 280) is ARMv8.0: it has no PAN
++ * (Privileged Access Never, ARMv8.1) register. The __builtin_arm_wsr("pan",1)
++ * in arm_init traps Undefined Instruction on this CPU, so keep PAN disabled
++ * exactly like an ARMv8.0 platform (no kernel PAN protection).
++ */
++#define __ARM_PAN_AVAILABLE__     0
+ #define HAS_GIC_V3                1
+ 
+ #ifndef ASSEMBLER
