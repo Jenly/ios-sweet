@@ -1,0 +1,64 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index f9f76a3..60951a6 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1840,6 +1840,16 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+  */
+ static pmap_paddr_t sweet_fb_pa = 0x9c000000ULL;
+ 
++/*
++ * T1SZ=17 (SWEET 0097) makes the TTBR1 root an L0 table, but arm_vm_init's
++ * table construction fills cpu_tte as a legacy L1 table.  This L0 wrapper
++ * points every L0 entry back at cpu_tte, so the L1 entries built below
++ * (KVA, physmap, dynamic memory, low globals) become reachable by the
++ * hardware.  It also gives sweet_early_map_final() the L0 level it reads
++ * (0115).
++ */
++static tt_entry_t *sweet_l0_root;
++
+ static void
+ sweet_early_map_final(void)
+ {
+@@ -1850,7 +1860,7 @@ sweet_early_map_final(void)
+ 	 * L0 table, so descend L0 -> L1 -> L2 instead of assuming L1 is the
+ 	 * root.
+ 	 */
+-	tt_entry_t l0 = cpu_tte[(va & ARM_TT_L0_INDEX_MASK) >> ARM_TT_L0_SHIFT];
++	tt_entry_t l0 = sweet_l0_root[(va & ARM_TT_L0_INDEX_MASK) >> ARM_TT_L0_SHIFT];
+ 	assert((l0 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l1 = (tt_entry_t *)phystokv(l0 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t l1e = l1[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+@@ -2034,6 +2044,21 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	cpu_tte = (tt_entry_t *)alloc_ptpage(TRUE);
+ 	cpu_ttep = kvtophys((vm_offset_t)cpu_tte);
+ 	bzero(cpu_tte, ARM_PGBYTES);
++#if defined(SWEET)
++	/* 0115: TTBR1 root is L0 (T1SZ=17); wrap the legacy L1 table so the
++	 * L1 entries constructed below are reachable by the hardware. */
++	sweet_l0_root = (tt_entry_t *)alloc_ptpage(TRUE);
++	bzero(sweet_l0_root, ARM_PGBYTES);
++	{
++		unsigned int i;
++		tt_entry_t l0e = (cpu_ttep & ARM_TTE_TABLE_MASK) |
++		    ARM_TTE_TYPE_TABLE | ARM_TTE_VALID |
++		    ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA);
++		for (i = 0; i < TTE_PGENTRIES; i++) {
++			sweet_l0_root[i] = l0e;
++		}
++	}
++#endif /* SWEET */
+ 	avail_end = gPhysBase + mem_size;
+ 	assert(!(avail_end & PAGE_MASK));
+ 
+@@ -2225,7 +2250,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	sweet_early_map_final();
+ #endif
+ 	arm_vm_physmap_init(args);
++#if defined(SWEET)
++	set_mmu_ttb_alternate(kvtophys((vm_offset_t)sweet_l0_root) & TTBR_BADDR_MASK);
++#else /* !SWEET */
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
++#endif /* SWEET */
+ 
+ 	ml_enable_monitor();
+ 
