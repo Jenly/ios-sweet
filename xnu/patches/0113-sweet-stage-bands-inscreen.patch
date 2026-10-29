@@ -1,0 +1,27 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -501,9 +501,11 @@
+ /*
+  * SWEET staged boot band.
+  *
+- * Paints a 64x12 band at row (height - 124 + idx*16): the 8 bands (12 rows tall,
+- * 16 rows apart) end exactly at the bottom row of the framebuffer, filling the
+- * dark strip below the red console area.
++ * Paints a 64x12 band at row (height - 140 + idx*16): the 8 bands (12 rows tall,
++ * 16 rows apart) sit fully inside the visible framebuffer -- idx 1 (white) starts
++ * at height-124, idx 8 (blue) ends at the bottom row height-1 -- filling the
++ * dark strip below the red console area. (The earlier height-124 formula assumed
++ * idx started at 0, so the blue band landed at height+4: off-screen.)
+  *
+  * Registers x9-x13 only: every call site below is at a point where those five are
+  * dead. That is deliberate -- saving to the stack is not an option before the kernel
+@@ -516,7 +516,7 @@
+ .macro SWEET_STAGE idx, colour
+ 	ldr		x9, [x20, BA_VIDEO_BASE]
+ 	ldr		x10, [x20, BA_VIDEO_ROW_BYTES]
+ 	ldr		x11, [x20, BA_VIDEO_HEIGHT]
+-	sub		x11, x11, #124
++	sub		x11, x11, #140
+ 	add		x11, x11, #(\idx * 16)
+ 	madd	x9, x10, x11, x9
