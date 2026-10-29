@@ -1,0 +1,13 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 41cb7a1..ea8c274 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,7 +515,7 @@ start_cpu:
+ .macro SWEET_STAGE idx, colour
+ 	ldr		x9, [x20, BA_VIDEO_BASE]
+ 	ldr		x10, [x20, BA_VIDEO_ROW_BYTES]
+-	mov		x11, #(800 + \idx * 16)
++	mov		x11, #(1400 + \idx * 16)
+ 	madd	x9, x10, x11, x9
+ 	/* The colour is <= 32 bits: build it without nesting MOV64, which
+ 	 * does not substitute a macro parameter into its shift expression. */
