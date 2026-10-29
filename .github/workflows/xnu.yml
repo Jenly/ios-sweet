@@ -52,8 +52,10 @@ jobs:
           # The arm64 slice must NOT use Xcode's default LSE atomics: the Kryo 280
           # (Cortex-A72) is ARMv8.0 and Undefined-Instructions on any LSE op.
           # Build it as plain arm64 with armv8-a (+crypto) and no outline atomics.
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-march=armv8-a+crypto -mno-outline-atomics"/' dxb/build.sh
-          grep -c 'ARCHS="arm64" VALID_ARCHS="arm64"' dxb/build.sh
+          # NOTE: command-line OTHER_CFLAGS overrides the xcconfig value, so we must
+          # repeat the original "-mkernel -nostdinc -Wno-packed" and then append.
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -march=armv8-a+crypto -mno-outline-atomics"/' dxb/build.sh
+          grep -c 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -march=armv8-a+crypto -mno-outline-atomics"' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
