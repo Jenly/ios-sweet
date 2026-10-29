@@ -1,0 +1,23 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index bf85b95..6993517 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -784,13 +784,17 @@ Lkernelcache_base_found:
+ 
+ 	/*
+ 	 * KVA TTBR1 root: with T1SZ=17 the root is an L0 table.  Wire
+-	 * L0[VA[47:39]] of the kernel's KVA base to the KVA L1 table.
++	 * L0[VA[46:39]] of the kernel's KVA base to the KVA L1 table.
++	 * T1SZ=17 gives a 47-bit VA input: L0 consumes 8 index bits
++	 * (VA[46:39]) and VA[47] is the sign/select bit, so the 9-bit
++	 * ARM_TT_L0_INDEX_MASK must be narrowed to 8 bits here.
+ 	 */
+ 	mov		x9, x1
+ 	add		x9, x9, PGBYTES						/* KVA L0 table = page 2 */
+ 	mov		x10, #(ARM_TTE_BOOT_TABLE)
+ 	and		x11, x14, #(ARM_TT_L0_INDEX_MASK)
+ 	lsr		x11, x11, #(ARM_TT_L0_SHIFT)
++	and		x11, x11, #0x7F					/* T1SZ=17: L0 index is 8 bits */
+ 	lsl		x11, x11, #(TTE_SHIFT)
+ 	add		x11, x9, x11
+ 	and		x12, x3, #(ARM_TTE_TABLE_MASK)
