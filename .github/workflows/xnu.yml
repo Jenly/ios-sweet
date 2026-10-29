@@ -48,9 +48,12 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
-          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
+          # The arm64 slice must NOT use Xcode's default LSE atomics: the Kryo 280
+          # (Cortex-A72) is ARMv8.0 and Undefined-Instructions on any LSE op.
+          # Build it as plain arm64 with armv8-a (+crypto) and no outline atomics.
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-march=armv8-a+crypto -mno-outline-atomics"/' dxb/build.sh
+          grep -c 'ARCHS="arm64" VALID_ARCHS="arm64"' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
