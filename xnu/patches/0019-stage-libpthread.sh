@@ -16,7 +16,7 @@ pthread_tmp=$(mktemp -d)
 trap 'rm -rf "$pthread_tmp"' EXIT
 git init -q "$pthread_tmp"
 git -C "$pthread_tmp" fetch -q --depth 1 \
-    https://github.com/apple-oss-distributions/libpthread "$pthread_sha"
+    git@git.jenly.cn:Jelly/libpthread.git "$pthread_sha"
 git -C "$pthread_tmp" checkout -q FETCH_HEAD
 [[ "$(git -C "$pthread_tmp" rev-parse HEAD)" == "$pthread_sha" ]]
 

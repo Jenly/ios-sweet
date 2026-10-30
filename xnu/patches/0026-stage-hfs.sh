@@ -17,7 +17,7 @@ hfs_tmp=$(mktemp -d)
 trap 'rm -rf "$hfs_tmp"' EXIT
 git init -q "$hfs_tmp"
 git -C "$hfs_tmp" fetch -q --depth 1 \
-    https://github.com/apple-oss-distributions/hfs "$hfs_sha"
+    git@git.jenly.cn:Jelly/hfs.git "$hfs_sha"
 git -C "$hfs_tmp" checkout -q FETCH_HEAD
 [[ "$(git -C "$hfs_tmp" rev-parse HEAD)" == "$hfs_sha" ]]
 
