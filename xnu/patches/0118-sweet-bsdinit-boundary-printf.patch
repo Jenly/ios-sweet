@@ -1,0 +1,42 @@
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -770,6 +770,7 @@
+ #ifdef  IOKIT
+ 	kernel_bootstrap_log("PE_lockdown_iokit");
+ 	PE_lockdown_iokit();
++	printf("DBG: after PE_lockdown_iokit\n");
+ #endif
+ 	/*
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
+@@ -786,6 +787,7 @@
+ 	 *	Start the user bootstrap.
+ 	 */
+ #ifdef  MACH_BSD
++	printf("DBG: calling bsd_init\n");
+ 	bsd_init();
+ #endif
+ 
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -490,6 +490,8 @@
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
++	printf("DBG: bsd_init enter (before throttle)\n");
++
+ #define DEBUG_BSDINIT 1
+ 
+ #if DEBUG_BSDINIT
+@@ -499,8 +501,10 @@
+ #endif
+ 
+ 	throttle_init();
++	printf("DBG: throttle_init done\n");
+ 
+ 	printf(copyright);
++	printf("DBG: copyright printed\n");
+ 
+ #if CONFIG_DEV_KMEM
+ 	bsd_init_kprintf("calling dev_kmem_init\n");
