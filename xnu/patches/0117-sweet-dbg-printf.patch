@@ -1,0 +1,72 @@
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -400,9 +400,8 @@
+ 	assert(startup_phase < upto);
+ 
+ 	while (cur < startup_entries_end && cur->subsystem <= upto) {
+-		if ((startup_debug & STARTUP_DEBUG_VERBOSE) &&
+-		    startup_phase >= STARTUP_SUB_KPRINTF) {
+-			kprintf("%s[%d, rank %d]: %p(%p)\n", __func__,
++		if (startup_phase >= STARTUP_SUB_KPRINTF) {
++			printf("DBG-ST[%d, rank %d]: %p(%p)\n",
+ 			    cur->subsystem, cur->rank, cur->func, cur->arg);
+ 		}
+ 		startup_phase = cur->subsystem - 1;
+diff --git a/bsd/kern/subr_log.c b/bsd/kern/subr_log.c
+--- a/bsd/kern/subr_log.c
++++ b/bsd/kern/subr_log.c
+@@ -548,6 +548,7 @@
+ 
+ 	printf("Firehose configured: %u chunks, %u io pages\n",
+ 	    __firehose_buffer_kernel_chunk_count, __firehose_num_kernel_io_pages);
++	printf("DBG: firehose done\n");
+ }
+ STARTUP(OSLOG, STARTUP_RANK_SECOND, oslog_init_firehose);
+ 
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -490,10 +490,10 @@
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
+-#define DEBUG_BSDINIT 0
++#define DEBUG_BSDINIT 1
+ 
+ #if DEBUG_BSDINIT
+-#define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
++#define bsd_init_kprintf(x, ...) printf("bsd_init: " x "\n", ## __VA_ARGS__)
+ #else
+ #define bsd_init_kprintf(x, ...)
+ #endif
+@@ -1078,15 +1078,18 @@
+ 	proc_t p = current_proc();
+ 
+ 	process_name("init", p);
++	printf("DBG: bsdinit_task enter\n");
+ 
+ 	/* Set up exception-to-signal reflection */
+ 	ux_handler_setup();
++	printf("DBG: ux_handler_setup done\n");
+ 
+ #if CONFIG_MACF
+ 	mac_cred_label_associate_user(proc_ucred(p));
+ #endif
+ 
+ 	vm_init_before_launchd();
++	printf("DBG: vm_init_before_launchd done\n");
+ 
+ #if CONFIG_XNUPOST
+ 	int result = bsd_list_tests();
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6874,6 +6874,7 @@
+ load_init_program(proc_t p)
+ {
+ 	uint32_t i;
++	printf("DBG: load_init_program enter\n");
+ 	int error;
+ 	vm_map_t map = current_map();
+ 	mach_vm_offset_t scratch_addr = 0;
