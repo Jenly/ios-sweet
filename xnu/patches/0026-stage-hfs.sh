@@ -16,8 +16,19 @@ hfs_sha=31d5ec238dfab485e78a9a30b8b92d13e8914f03
 hfs_tmp=$(mktemp -d)
 trap 'rm -rf "$hfs_tmp"' EXIT
 git init -q "$hfs_tmp"
-git -C "$hfs_tmp" fetch -q --depth 1 \
-    git@git.jenly.cn:Jelly/hfs.git "$hfs_sha"
+# Prefer the in-LAN mirror (internal Jenkins nodes); fall back to the public
+# upstream, because GitHub-hosted runners cannot reach git.jenly.cn.
+fetched=0
+for mirror in git@git.jenly.cn:Jelly/hfs.git \
+              https://github.com/apple-oss-distributions/hfs; do
+    if GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=8 -o BatchMode=yes}" \
+        git -C "$hfs_tmp" fetch -q --depth 1 "$mirror" "$hfs_sha" 2>/dev/null; then
+        fetched=1
+        break
+    fi
+    echo "hfs: fetch failed from $mirror, trying next source" >&2
+done
+[[ "$fetched" == 1 ]] || { echo 'hfs: no usable source for pinned commit' >&2; exit 1; }
 git -C "$hfs_tmp" checkout -q FETCH_HEAD
 [[ "$(git -C "$hfs_tmp" rev-parse HEAD)" == "$hfs_sha" ]]
 

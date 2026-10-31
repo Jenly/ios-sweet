@@ -7,8 +7,19 @@ bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
 bearssl_tmp=$(mktemp -d)
 trap 'rm -rf "$bearssl_tmp"' EXIT
 git init -q "$bearssl_tmp"
-git -C "$bearssl_tmp" fetch -q --depth 1 \
-    git@git.jenly.cn:Jelly/BearSSL.git "$bearssl_sha"
+# Prefer the in-LAN mirror (internal Jenkins nodes); fall back to the public
+# upstream, because GitHub-hosted runners cannot reach git.jenly.cn.
+fetched=0
+for mirror in git@git.jenly.cn:Jelly/BearSSL.git \
+              https://www.bearssl.org/git/BearSSL; do
+    if GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=8 -o BatchMode=yes}" \
+        git -C "$bearssl_tmp" fetch -q --depth 1 "$mirror" "$bearssl_sha" 2>/dev/null; then
+        fetched=1
+        break
+    fi
+    echo "BearSSL: fetch failed from $mirror, trying next source" >&2
+done
+[[ "$fetched" == 1 ]] || { echo 'BearSSL: no usable source for pinned commit' >&2; exit 1; }
 git -C "$bearssl_tmp" checkout -q FETCH_HEAD
 [[ "$(git -C "$bearssl_tmp" rev-parse HEAD)" == "$bearssl_sha" ]]
 python3 - "$bearssl_tmp" <<'PY'

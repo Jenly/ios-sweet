@@ -15,8 +15,19 @@ pthread_sha=a6c70ca0e544347a0377babf748f831577ec24f9
 pthread_tmp=$(mktemp -d)
 trap 'rm -rf "$pthread_tmp"' EXIT
 git init -q "$pthread_tmp"
-git -C "$pthread_tmp" fetch -q --depth 1 \
-    git@git.jenly.cn:Jelly/libpthread.git "$pthread_sha"
+# Prefer the in-LAN mirror (internal Jenkins nodes); fall back to the public
+# upstream, because GitHub-hosted runners cannot reach git.jenly.cn.
+fetched=0
+for mirror in git@git.jenly.cn:Jelly/libpthread.git \
+              https://github.com/apple-oss-distributions/libpthread; do
+    if GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=8 -o BatchMode=yes}" \
+        git -C "$pthread_tmp" fetch -q --depth 1 "$mirror" "$pthread_sha" 2>/dev/null; then
+        fetched=1
+        break
+    fi
+    echo "libpthread: fetch failed from $mirror, trying next source" >&2
+done
+[[ "$fetched" == 1 ]] || { echo 'libpthread: no usable source for pinned commit' >&2; exit 1; }
 git -C "$pthread_tmp" checkout -q FETCH_HEAD
 [[ "$(git -C "$pthread_tmp" rev-parse HEAD)" == "$pthread_sha" ]]
 
