@@ -1,0 +1,124 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -690,10 +690,12 @@
+ 	 */
+ 	bsd_init_kprintf("calling IOKitInitializeTime\n");
+ 	IOKitInitializeTime();
++	printf("PRB 28 bsd_init: IOKitInitializeTime returned\n");
+ 
+ 	/* Initialize the file systems. */
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
++	printf("PRB 29 bsd_init: vfsinit returned\n");
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	/* AMFI's MAC policy is built in on SWEET (bsd/kern/sweet_amfi.c). */
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -73,14 +73,36 @@
+ IOKitInitializeTime( void )
+ {
+ 	mach_timespec_t         t;
++	int                     step;
++	bool                    rtc_found = false;
++
++	/* sweet 0123: this call is the last marker the panel shows */
++	IOLog("PRB 24 IOKitInitializeTime enter\n");
+ 
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
+ // RTC is not present on this target
+ #ifndef BCM2837
+-	IOService::waitForService(
+-		IOService::resourceMatching("IORTC"), &t );
++	/*
++	 * sweet 0123: three short waits instead of one 30 s wait.  This answers
++	 * two questions for free: whether the kernel tick really runs (every step
++	 * needs a timer deadline to expire), and whether the IOKit matching thread
++	 * makes progress while the bootstrap thread sleeps.  The boot always
++	 * continues afterwards -- there is no RTC on this board, so waiting for
++	 * one must never be able to stall the boot.
++	 */
++	for (step = 1; step <= 3; step++) {
++		t.tv_sec = 1;
++		t.tv_nsec = 0;
++		IOLog("PRB 25 IORTC wait %d/3 (tick probe)\n", step);
++		if (IOService::waitForService(
++		    IOService::resourceMatching("IORTC"), &t )) {
++			rtc_found = true;
++			break;
++		}
++	}
++	IOLog("PRB 26 IORTC wait done found=%d\n", rtc_found);
+ #endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+@@ -88,6 +110,7 @@
+ #endif
+ 
+ 	clock_initialize_calendar();
++	IOLog("PRB 27 calendar done, leaving IOKitInitializeTime\n");
+ }
+ 
+ void
+--- a/osfmk/console/serial_general.c
++++ b/osfmk/console/serial_general.c
+@@ -155,10 +155,57 @@
+ 	}
+ }
+ 
++#if defined(SWEET)
++/*
++ * sweet 0123: stamp every rendered console line with a running number.
++ * The framebuffer console wraps back to the top of the screen instead of
++ * scrolling, and the IOKit matching thread interleaves its output with the
++ * bootstrap thread, so a photo of the panel cannot be put in order by layout
++ * alone.  A line carrying a number from an older sequence is also left over
++ * from a previous boot and must not be read as the newest output.
++ */
++static uint32_t sweet_console_line_no;
++
++static void
++sweet_console_line_prefix(char * str, int * pos)
++{
++	uint32_t n;
++	char     tmp[12];
++	char     pfx[16];
++	int      t = 0, i = 0, k;
++
++	n = ++sweet_console_line_no;
++	while (n > 0) {
++		tmp[t++] = (char)('0' + (n % 10));
++		n /= 10;
++	}
++	while (t < 6) {
++		tmp[t++] = '0';
++	}
++	while (t > 0) {
++		pfx[i++] = tmp[--t];
++	}
++	pfx[i++] = ':';
++	pfx[i++] = ' ';
++	for (k = 0; k < i && *pos < (SERIAL_CONS_BUF_SIZE - 1); k++) {
++		str[*pos] = pfx[k];
++		*pos += 1;
++	}
++	str[*pos] = '\0';
++}
++#endif /* SWEET */
++
+ void
+ console_printbuf_putc(int ch, void * arg)
+ {
+ 	struct console_printbuf_state * info = (struct console_printbuf_state *)arg;
++
++#if defined(SWEET)
++	if (ch != '\n' && info->pos == 0) {
++		sweet_console_line_prefix(&info->str[0], &info->pos);
++	}
++#endif /* SWEET */
++
+ 	info->total += 1;
+ 	if (info->pos < (SERIAL_CONS_BUF_SIZE - 1)) {
+ 		info->str[info->pos] = (char)ch;
