@@ -1,0 +1,221 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 64f1711..7b5986d 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -22,4 +22,8 @@
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++/* 0125: pe_fiq.c -- GIC audit; sleh_irq counts what arrives */
++extern "C" void sweet_gic_audit(void);
++extern "C" uint64_t sweet_irq_count;
++extern "C" uint64_t sweet_irq_trace;
+ 
+ class SweetCPU;
+@@ -183,4 +187,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
+ 	}
++	/* 0125: chiron takes no interrupt at all, so audit and repair the GIC
++	 * before the first SGI is sent instead of after it has been missed. */
++	sweet_gic_audit();
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+@@ -214,10 +221,10 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 				}
+ 				if ((++beat % 2000U) == 0) {   /* about once a second */
+-					IOLog("PRB 31 wait cpu=%u initialized=%u sgi=%u irqs=%u cntpct=%llu abs=%llu beat=%u\n",
++					IOLog("PRB 31 wait cpu=%u initialized=%u sgi=%u irqs=%u cntpct=%llu abs=%llu beat=%u irqcnt=%llu trace=%llx\n",
+ 					    i, __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+ 					    sweet_cpu_signal_is_enabled(i) ? 1 : 0,
+ 					    ml_get_interrupts_enabled(),
+ 					    __builtin_arm_rsr64("CNTPCT_EL0"),
+-					    mach_absolute_time(), beat);
++					    mach_absolute_time(), beat, sweet_irq_count, sweet_irq_trace);
+ 				}
+ 				if (beat >= 12000U || mach_absolute_time() > deadline) {
+@@ -228,8 +235,8 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		if (timed_out) {
+-			IOLog("PRB 32 startAll: cpu=%u gave up waiting (initialized=%u sgi=%u irqs=%u)\n",
++			IOLog("PRB 32 startAll: cpu=%u gave up waiting (initialized=%u sgi=%u irqs=%u irqcnt=%llu trace=%llx)\n",
+ 			    i, __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+ 			    sweet_cpu_signal_is_enabled(i) ? 1 : 0,
+-			    ml_get_interrupts_enabled());
++			    ml_get_interrupts_enabled(), sweet_irq_count, sweet_irq_trace);
+ 		} else {
+ 			IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..ebb09d2 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1868,5 +1868,15 @@ sleh_irq(arm_saved_state_t *state)
+ 		return; /* spurious */
+ 	}
+-	if (intid == sweet_vtimer_intid) {
++	/* 0125: record what actually reaches the CPU; startAll prints it. */
++	extern uint64_t sweet_irq_count;
++	extern uint64_t sweet_irq_trace;
++	extern uint32_t sweet_vtimer_intid_alt;
++	if (sweet_irq_count < 8) {
++		sweet_irq_trace |= ((uint64_t)(intid & 0xFF)) << (8 * sweet_irq_count);
++	}
++	sweet_irq_count++;
++	/* 0125: the ADT says 27, the board default measured 19 on Qualcomm; take
++	 * either, and let the PPI trace say which one actually fires. */
++	if (intid == sweet_vtimer_intid || intid == sweet_vtimer_intid_alt) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..1f32498 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -51,4 +51,48 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
+ 
++/*
++ * 0125: interrupt-delivery audit.
++ *
++ * chiron takes no interrupt at all: the self-SGI that clears SIGPdisabled
++ * never arrives, so SweetCPU::startAll parks for its whole deadline, and the
++ * IORC wait in IOKitInitializeTime never expires -- yet CNTPCT keeps running
++ * and both DAIF and ICC_PMR_EL1 say IRQs are unmasked.  The identical kernel
++ * boots through to load_init_program() under QEMU, so the state the platform
++ * handed the GIC to us in is the suspect.  Snapshot it while it is still
++ * fresh, report it from inside the console scrollback window instead of
++ * trusting the early log to survive, then rewrite everything we depend on and
++ * say what the writes landed.
++ */
++#if defined(SWEET)
++uint64_t sweet_irq_count = 0;           /* IRQs taken since boot */
++uint64_t sweet_irq_trace = 0;           /* first 8 INTIDs, 8 bits each */
++uint32_t sweet_vtimer_intid_alt = SWEET_VTIMER_INTID;  /* board default, 19 */
++
++static vm_offset_t sweet_pe_base;
++static vm_offset_t sweet_gicd_va;
++static vm_offset_t sweet_gicr_va;
++static uint32_t sweet_boot_gicd_ctlr;
++static uint32_t sweet_boot_gicd_typer;
++static uint64_t sweet_boot_gicr_typer;
++static uint32_t sweet_boot_gicr_waker;
++static uint32_t sweet_boot_gicr_en0;
++static uint64_t sweet_boot_icc_sre;
++static uint64_t sweet_boot_icc_pmr;
++static uint64_t sweet_boot_icc_igrp1;
++static uint64_t sweet_boot_icc_hppir;
++
++static uint32_t
++sweet_gicr_rd32(uint32_t off)
++{
++	return _gic_read32(sweet_pe_base + off);
++}
++
++static void
++sweet_gicr_wr32(uint32_t off, uint32_t value)
++{
++	_gic_write32(sweet_pe_base + off, value);
++}
++#endif /* SWEET */
++
+ static vm_offset_t
+ find_gicr_pe_base()
+@@ -74,4 +118,79 @@ find_gicr_pe_base()
+ }
+ 
++#if defined(SWEET)
++/*
++ * 0125: GIC / interrupt-delivery audit, called from SweetCPU::startAll before
++ * the first SGI is sent.  Prints the state the platform handed us, repairs the
++ * pieces that can silently stop every delivery, and prints what the writes
++ * landed.  IntIDs seen are counted by sleh_irq and printed by the caller.
++ */
++void
++sweet_gic_audit(void)
++{
++	uint32_t waker;
++	uint32_t gicd_ctlr;
++	unsigned int i;
++
++	kprintf("PRB 36 GIC boot: d=%lx r=%lx pe=%lx ctlr=%x typer=%x/%llx waker=%x en0=%x\n",
++	    (unsigned long)sweet_gicd_va, (unsigned long)sweet_gicr_va,
++	    (unsigned long)sweet_pe_base, sweet_boot_gicd_ctlr, sweet_boot_gicd_typer,
++	    sweet_boot_gicr_typer, sweet_boot_gicr_waker, sweet_boot_gicr_en0);
++	kprintf("PRB 37 ICC boot: sre=%llx pmr=%llx bpr1=%llx igrp1=%llx hppir=%llx vt=%u/%u\n",
++	    sweet_boot_icc_sre, sweet_boot_icc_pmr,
++	    __builtin_arm_rsr64("ICC_BPR1_EL1"), sweet_boot_icc_igrp1,
++	    sweet_boot_icc_hppir, sweet_vtimer_intid, sweet_vtimer_intid_alt);
++	kprintf("PRB 38 timer: cntv_ctl=%llx cntv_cval=%llx cntvct=%llx cntpct=%llx frq=%llx irqcnt=%llx trace=%llx\n",
++	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_CVAL_EL0"),
++	    __builtin_arm_rsr64("CNTVCT_EL0"), __builtin_arm_rsr64("CNTPCT_EL0"),
++	    __builtin_arm_rsr64("CNTFRQ_EL0"), sweet_irq_count, sweet_irq_trace);
++
++	/*
++	 * Wake the redistributor.  pe_init_fiq() only writes GICR_WAKER when
++	 * ChildrenAsleep already reads set, so a PE sitting in ProcessorSleep
++	 * alone is never woken -- and a sleeping PE receives nothing at all.
++	 */
++	waker = sweet_gicr_rd32(GICR_WAKER);
++	if (waker & GICR_WAKER_PROCESSORSLEEP) {
++		sweet_gicr_wr32(GICR_WAKER, waker & ~GICR_WAKER_PROCESSORSLEEP);
++		for (i = 0; i < 1000000U; i++) {
++			if (!(sweet_gicr_rd32(GICR_WAKER) & GICR_WAKER_CHILDRENASLEEP)) {
++				break;
++			}
++		}
++	}
++
++	/*
++	 * SGI1 for the IPI path plus the whole PPI range.  The ADT says this SoC
++	 * wires the virtual timer to INTID 27 while the shim measured 19 on
++	 * Qualcomm parts; enabling the PPIs costs nothing (an unhandled one is
++	 * EOId by sleh_irq) and the trace then says which INTID actually fires.
++	 */
++	sweet_gicr_wr32(GICR_IGROUPR0, 0xFFFFFFFF);
++	sweet_gicr_wr32(GICR_ISENABLER0, 0xFFFF0002U);
++
++	gicd_ctlr = gicd_read32(GICD_CTLR);
++	gicd_ctlr |= GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1;
++	gicd_write32(GICD_CTLR, gicd_ctlr);
++	for (i = 0; i < 1000000U; i++) {
++		if (!(gicd_read32(GICD_CTLR) & GICD_CTLR_RWP)) {
++			break;
++		}
++	}
++
++	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | ICC_SRE_SRE);
++	__builtin_arm_isb(ISB_SY);
++	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
++	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
++	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
++	__builtin_arm_isb(ISB_SY);
++
++	kprintf("PRB 39 GIC now: ctlr=%x waker=%x en0=%x sre=%llx pmr=%llx igrp1=%llx hppir=%llx\n",
++	    gicd_read32(GICD_CTLR), sweet_gicr_rd32(GICR_WAKER),
++	    sweet_gicr_rd32(GICR_ISENABLER0),
++	    __builtin_arm_rsr64("ICC_SRE_EL1"), __builtin_arm_rsr64("ICC_PMR_EL1"),
++	    __builtin_arm_rsr64("ICC_IGRPEN1_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"));
++}
++#endif /* SWEET */
++
+ void
+ pe_init_fiq()
+@@ -146,4 +265,21 @@ pe_init_fiq()
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++#if defined(SWEET)
++	/* 0125: as-booted snapshot, boot CPU only (the audit runs there first) */
++	if (sweet_gicd_va == 0) {
++		sweet_pe_base = gicr_pe_base;
++		sweet_gicd_va = gicd_base;
++		sweet_gicr_va = gicr_base;
++		sweet_boot_gicd_ctlr  = gicd_read32(GICD_CTLR);
++		sweet_boot_gicd_typer = gicd_read32(0x4);       /* GICD_TYPER */
++		sweet_boot_gicr_typer = gicr_read64(GICR_TYPER);
++		sweet_boot_gicr_waker = gicr_read32(GICR_WAKER);
++		sweet_boot_gicr_en0   = gicr_read32(GICR_ISENABLER0);
++		sweet_boot_icc_sre    = __builtin_arm_rsr64("ICC_SRE_EL1");
++		sweet_boot_icc_pmr    = __builtin_arm_rsr64("ICC_PMR_EL1");
++		sweet_boot_icc_igrp1  = __builtin_arm_rsr64("ICC_IGRPEN1_EL1");
++		sweet_boot_icc_hppir  = __builtin_arm_rsr64("ICC_HPPIR1_EL1");
++	}
++#endif
+ 
+ 	// Mark this PE to be awake
