@@ -1,0 +1,22 @@
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -789,10 +789,16 @@
+ 	printf("PRB 21 vmrestrict out\n");
+ 
+ 
+ #if KPERF
+ 	printf("PRB 22 kperf in\n");
+-	kperf_init_early();
+-	printf("PRB 23 kperf out\n");
++	/*
++	 * 0122: kperf_init_early() does not return on SWEET -- the 0121 real-device
++	 * boot printed "PRB 22 kperf in" and nothing after it, which brackets the
++	 * stall to that call.  kperf/kpc are stubs on this build (patch 0008) with no
++	 * hardware counters to program, and nothing later in the boot path needs the
++	 * early kperf state, so skip the call and let the boot continue.
++	 */
++	printf("PRB 23 kperf SKIPPED (0122)\n");
+ #endif
+ 
+ 	/*
