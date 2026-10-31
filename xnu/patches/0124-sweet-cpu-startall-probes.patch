@@ -1,0 +1,102 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -149,6 +149,22 @@
+ 	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
+ 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
+ 
++	/* sweet 0124: prove that the architected counter, the IRQ state and the
++	 * console are alive before this thread parks on a timer-driven deadline.
++	 * A frozen mach_absolute_time() or a timer interrupt that never arrives
++	 * is invisible to IOSleep(), so compare the raw counter across a spin. */
++	{
++		uint64_t abs0 = mach_absolute_time();
++		uint64_t pct0 = __builtin_arm_rsr64("CNTPCT_EL0");
++		uint64_t frq0 = __builtin_arm_rsr64("CNTFRQ_EL0");
++		for (volatile uint64_t spin = 0; spin < 50000000ULL; spin++) {
++			__asm__ volatile("yield");
++		}
++		IOLog("PRB 30 startAll: cntpct=%llu->%llu frq=%llu abs=%llu->%llu irqs=%u\n",
++		    pct0, __builtin_arm_rsr64("CNTPCT_EL0"), frq0, abs0,
++		    mach_absolute_time(), ml_get_interrupts_enabled());
++	}
++
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+ 	while (__atomic_load_n(&sweet_cpus_registered, __ATOMIC_ACQUIRE) != topology->num_cpus) {
+@@ -168,23 +184,57 @@
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++		/* 0124: processor_start() is asynchronous for secondaries, but for the
++		 * boot CPU it re-enters cpu_machine_init -> initCPU().  Log both sides
++		 * so a stall inside it cannot be read as a stall in the wait below. */
++		IOLog("PRB 33 startAll: cpu=%u processor_start\n", i);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
++		IOLog("PRB 34 startAll: cpu=%u processor_start kr=%d state=%d\n",
++		    i, kr, (int)cpu->getCPUState());
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+-		/* processor_start() is asynchronous for secondaries in this XNU. */
++		/* 0124: this gate must not need the timer to be alive.  Every other
++		 * wait here needs a deadline to expire, and a missing timer interrupt
++		 * makes such a wait indistinguishable from a hung CPU, so pause on the
++		 * architected counter, report progress, and boot on past the gate
++		 * instead of panicking -- advancing exposes the next stop point. */
++		boolean_t timed_out = FALSE;
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+-		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+-		    !sweet_cpu_signal_is_enabled(i)) {
+-			if (mach_absolute_time() > deadline) {
+-				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+-				    i, topology->cpus[i].phys_id);
+-				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++		{
++			uint64_t frq = __builtin_arm_rsr64("CNTFRQ_EL0");
++			uint64_t pause = (frq >= 2000) ? (frq / 2000) : 1;  /* ~0.5 ms */
++			unsigned int beat = 0;
++
++			while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
++			    !sweet_cpu_signal_is_enabled(i)) {
++				uint64_t t0 = __builtin_arm_rsr64("CNTPCT_EL0");
++				while ((__builtin_arm_rsr64("CNTPCT_EL0") - t0) < pause) {
++					__asm__ volatile("yield");
++				}
++				if ((++beat % 2000U) == 0) {   /* about once a second */
++					IOLog("PRB 31 wait cpu=%u initialized=%u sgi=%u irqs=%u cntpct=%llu abs=%llu beat=%u\n",
++					    i, __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++					    sweet_cpu_signal_is_enabled(i) ? 1 : 0,
++					    ml_get_interrupts_enabled(),
++					    __builtin_arm_rsr64("CNTPCT_EL0"),
++					    mach_absolute_time(), beat);
++				}
++				if (beat >= 12000U || mach_absolute_time() > deadline) {
++					timed_out = TRUE;
++					break;
++				}
+ 			}
+-			IOSleep(1);
+ 		}
+-		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+-		    i, topology->cpus[i].phys_id);
++		if (timed_out) {
++			IOLog("PRB 32 startAll: cpu=%u gave up waiting (initialized=%u sgi=%u irqs=%u)\n",
++			    i, __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++			    sweet_cpu_signal_is_enabled(i) ? 1 : 0,
++			    ml_get_interrupts_enabled());
++		} else {
++			IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
++			    i, topology->cpus[i].phys_id);
++		}
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+@@ -242,6 +292,8 @@
+ 	    (((mpidr >> 16) & 0xff) << 32) |
+ 	    (((mpidr >> 8) & 0xff) << 16) |
+ 	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
++	IOLog("PRB 35 signalCPU: target=%u sgi=0x%llx irqs=%u\n",
++	    logical, sgi, ml_get_interrupts_enabled());
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+ 	__builtin_arm_isb(ISB_SY);
