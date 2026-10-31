@@ -1,0 +1,18 @@
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -784,11 +784,15 @@
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
+ 	 * at the latest
+ 	 */
++	printf("PRB 20 vmrestrict in\n");
+ 	vm_set_restrictions(machine_info.max_cpus);
++	printf("PRB 21 vmrestrict out\n");
+ 
+ 
+ #if KPERF
++	printf("PRB 22 kperf in\n");
+ 	kperf_init_early();
++	printf("PRB 23 kperf out\n");
+ #endif
+ 
+ 	/*
