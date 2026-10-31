@@ -1,0 +1,45 @@
+--- a/osfmk/kern/startup.c	2026-10-31 01:34:57.003974577 +0000
++++ b/osfmk/kern/startup.c	2026-10-31 01:34:50.773712772 +0000
+@@ -738,12 +738,15 @@
+ 
+ 	/* Initialize the runtime for the trust cache interface */
+ 	trust_cache_runtime_init();
++	printf("DBG: after trust_cache_runtime_init\n");
+ 
+ 	/* Load the static and engineering trust caches */
+ 	load_static_trust_cache();
++	printf("DBG: after load_static_trust_cache\n");
+ #endif
+ 
+ 	kernel_startup_initialize_upto(STARTUP_SUB_LOCKDOWN);
++	printf("DBG: after startup_upto_lockdown\n");
+ 
+ 	/*
+ 	 * Get rid of segments used to bootstrap kext loading. This removes
+@@ -753,14 +756,18 @@
+ 	 */
+ 	kernel_bootstrap_log("OSKextRemoveKextBootstrap");
+ 	OSKextRemoveKextBootstrap();
++	printf("DBG: after OSKextRemoveKextBootstrap\n");
+ 
+ 	/* No changes to kernel text and rodata beyond this point. */
+ 	kernel_bootstrap_log("machine_lockdown");
+ 	machine_lockdown();
++	printf("DBG: after machine_lockdown\n");
+ 
+ #ifdef CONFIG_XNUPOST
++	printf("DBG: calling kernel_do_post\n");
+ 	kern_return_t result = kernel_list_tests();
+ 	result = kernel_do_post();
++	printf("DBG: after kernel_do_post\n");
+ 	if (result != KERN_SUCCESS) {
+ 		panic("kernel_do_post: Tests failed with result = 0x%08x", result);
+ 	}
+@@ -769,6 +776,7 @@
+ 
+ #ifdef  IOKIT
+ 	kernel_bootstrap_log("PE_lockdown_iokit");
++	printf("DBG: calling PE_lockdown_iokit\n");
+ 	PE_lockdown_iokit();
+ 	printf("DBG: after PE_lockdown_iokit\n");
+ #endif
