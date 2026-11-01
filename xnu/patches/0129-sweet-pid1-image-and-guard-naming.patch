@@ -1,0 +1,460 @@
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1132,6 +1132,442 @@
+ 	sweet_crash_dump_0127(thread, kind, 0, 0, 0);
+ }
+ 
++/* SWEET 0129: name the library (and, best effort, the function) behind the raw
++ * pid-1 kill PCs that 0127/0128 printed.  0128 closed the death chain down to a
++ * brk inside the dyld shared cache; "an offset in the cache" cannot pick a fix,
++ * "libxpc.dylib+0x2f5c" can.  Every read below goes through copyin (fault safe)
++ * and every loop is hard bounded: a probe that goes silent, or panics before it
++ * prints, costs a whole build + flash + photo cycle.
++ *
++ * For the guard exceptions it also dumps mach_msg's own arguments (x0..x5), the
++ * outgoing message header and pid 1's port name table state; that is what
++ * decides whether the bogus reply-port name came out of user space or out of
++ * the kernel ipc layer.
++ */
++#include <kdp/kdp_dyld.h>
++#include <ipc/ipc_space.h>
++#include <ipc/ipc_entry.h>
++
++#define SWEET_IMG_MAX_0129      8
++#define SWEET_IMG_BLOCK_0129    8
++#define SWEET_LC_MAX_0129       16384
++
++/* nlist_64, only the fields a nearest-symbol search needs */
++struct sweet_nl_0129 {
++	uint32_t strx;
++	uint8_t  type;
++	uint8_t  sect;
++	uint16_t desc;
++	uint64_t value;
++};
++
++struct sweet_img_0129 {
++	uint64_t     addr;
++	uint64_t     base;
++	uint64_t     path;
++	const char  *tag;
++};
++
++static struct sweet_img_0129 sweet_img_0129[SWEET_IMG_MAX_0129];
++static int     sweet_img_n_0129;
++static boolean_t sweet_aii_done_0129;
++
++static void
++sweet_img_gather_0129(uint64_t addr, const char *tag)
++{
++	int i;
++
++	if (addr == 0) {
++		return;
++	}
++	for (i = 0; i < sweet_img_n_0129; i++) {
++		if (sweet_img_0129[i].addr == addr) {
++			return;                 /* pc == backtrace[0] most of the time */
++		}
++	}
++	if (sweet_img_n_0129 >= SWEET_IMG_MAX_0129) {
++		return;
++	}
++	sweet_img_0129[sweet_img_n_0129].addr = addr;
++	sweet_img_0129[sweet_img_n_0129].base = 0;
++	sweet_img_0129[sweet_img_n_0129].path = 0;
++	sweet_img_0129[sweet_img_n_0129].tag  = tag;
++	sweet_img_n_0129++;
++}
++
++static void
++sweet_img_short_0129(char *out, size_t outsz, const char *path)
++{
++	const char *p = path;
++	size_t      n;
++
++	for (const char *q = path; *q != '\0'; q++) {
++		if (*q == '/') {
++			p = q + 1;
++		}
++	}
++	n = strlen(p);
++	if (n > 6 && strcmp(p + n - 6, ".dylib") == 0) {
++		n -= 6;                         /* libxpc.dylib -> libxpc */
++	}
++	if (n > outsz - 1) {
++		n = outsz - 1;
++	}
++	memcpy(out, p, n);
++	out[n] = '\0';
++	if (n == 0) {
++		strlcpy(out, "?", outsz);
++	}
++}
++
++static void
++sweet_img_resolve_0129(void)
++{
++	struct user64_dyld_all_image_infos aii;
++	mach_vm_address_t                  aiia = task_get_all_image_info_addr(current_task());
++	uint32_t                           cnt, i;
++	int                                j;
++
++	if (sweet_img_n_0129 == 0) {
++		return;
++	}
++	if (aiia == 0 || copyin((user_addr_t)aiia, &aii, sizeof(aii)) != 0 ||
++	    aii.infoArrayCount == 0 || aii.infoArray == 0) {
++		printf("0129 AII none 0x%llx\n", (uint64_t)aiia);
++		sweet_img_n_0129 = 0;
++		return;
++	}
++	if (!sweet_aii_done_0129) {
++		sweet_aii_done_0129 = TRUE;
++		printf("0129 AII v%u n%u slide 0x%llx\n", aii.version, aii.infoArrayCount,
++		    (uint64_t)aii.sharedCacheSlide);
++	}
++	cnt = aii.infoArrayCount;
++	if (cnt > 4096) {
++		cnt = 4096;
++	}
++
++	for (i = 0; i < cnt; i += SWEET_IMG_BLOCK_0129) {
++		struct user64_dyld_image_info info[SWEET_IMG_BLOCK_0129];
++		uint32_t                      n = cnt - i;
++
++		if (n > SWEET_IMG_BLOCK_0129) {
++			n = SWEET_IMG_BLOCK_0129;
++		}
++		if (copyin((user_addr_t)(aii.infoArray + (uint64_t)i * sizeof(info[0])),
++		    info, n * sizeof(info[0])) != 0) {
++			break;
++		}
++		for (uint32_t k = 0; k < n; k++) {
++			uint64_t base = (uint64_t)info[k].imageLoadAddress;
++
++			if (base == 0) {
++				continue;
++			}
++			for (j = 0; j < sweet_img_n_0129; j++) {
++				struct sweet_img_0129 *e = &sweet_img_0129[j];
++
++				if (base <= e->addr && base > e->base) {
++					e->base = base;
++					e->path = (uint64_t)info[k].imageFilePath;
++				}
++			}
++		}
++	}
++
++	for (j = 0; j < sweet_img_n_0129; j++) {
++		struct sweet_img_0129 *e = &sweet_img_0129[j];
++		char                   name[28];
++
++		strlcpy(name, "?", sizeof(name));
++		if (e->base == 0) {
++			printf("0129 IMG %s 0x%llx no image\n", e->tag, e->addr);
++			continue;
++		}
++		if (e->path != 0) {
++			char path[104];
++
++			memset(path, 0, sizeof(path));
++			if (copyin((user_addr_t)e->path, path, sizeof(path) - 1) != 0) {
++				path[0] = '\0';
++			}
++			sweet_img_short_0129(name, sizeof(name), path);
++		}
++		printf("0129 IMG %s 0x%llx %s+0x%llx\n", e->tag, e->addr, name,
++		    e->addr - e->base);
++	}
++}
++
++static boolean_t
++sweet_sym_ok_0129(const char *s)
++{
++	size_t n = 0;
++
++	while (s[n] != '\0') {
++		char c = s[n];
++
++		if (c < 0x21 || c > 0x7e) {
++			return FALSE;
++		}
++		if (++n > 48) {
++			break;
++		}
++	}
++	return n >= 3;
++}
++
++/* largest symbol whose value <= key, plus sanity checks that reject a hit from
++ * a symbol table that we mis-located (wrong symoff origin, wrong value base) */
++static boolean_t
++sweet_sym_find_0129(uint64_t symtab, uint32_t nsyms, uint64_t strtab, uint32_t strsize,
++    uint64_t key, char *out, size_t outsz, uint64_t *delta)
++{
++	uint32_t              lo = 0, hi = nsyms, best = 0;
++	boolean_t             got = FALSE;
++	struct sweet_nl_0129  nl;
++
++	while (lo < hi) {
++		uint32_t mid = lo + (hi - lo) / 2;
++
++		if (copyin((user_addr_t)(symtab + (uint64_t)mid * sizeof(nl)), &nl, sizeof(nl)) != 0) {
++			return FALSE;
++		}
++		if (nl.value <= key) {
++			best = mid;
++			got  = TRUE;
++			lo   = mid + 1;
++		} else {
++			hi = mid;
++		}
++	}
++	if (!got) {
++		return FALSE;
++	}
++	if (copyin((user_addr_t)(symtab + (uint64_t)best * sizeof(nl)), &nl, sizeof(nl)) != 0) {
++		return FALSE;
++	}
++	if (nl.value > key || (key - nl.value) >= 4096) {
++		return FALSE;
++	}
++	if (best > 0) {
++		struct sweet_nl_0129 prev;
++
++		if (copyin((user_addr_t)(symtab + (uint64_t)(best - 1) * sizeof(nl)), &prev, sizeof(prev)) != 0 ||
++		    prev.value > nl.value) {
++			return FALSE;
++		}
++	}
++	if (best + 1 < nsyms) {
++		struct sweet_nl_0129 next;
++
++		if (copyin((user_addr_t)(symtab + (uint64_t)(best + 1) * sizeof(nl)), &next, sizeof(next)) != 0 ||
++		    next.value < nl.value) {
++			return FALSE;
++		}
++	}
++	if (nl.strx == 0 || nl.strx >= strsize) {
++		return FALSE;
++	}
++	{
++		char name[64];
++
++		memset(name, 0, sizeof(name));
++		if (copyin((user_addr_t)(strtab + nl.strx), name, sizeof(name) - 1) != 0) {
++			return FALSE;
++		}
++		if (!sweet_sym_ok_0129(name)) {
++			return FALSE;
++		}
++		strlcpy(out, name, outsz);
++	}
++	*delta = key - nl.value;
++	return TRUE;
++}
++
++static void
++sweet_sym_0129(int idx)
++{
++	struct sweet_img_0129 *e = &sweet_img_0129[idx];
++	struct {
++		uint32_t magic;
++		uint32_t cputype;
++		uint32_t cpusubtype;
++		uint32_t filetype;
++		uint32_t ncmds;
++		uint32_t sizeofcmds;
++		uint32_t flags;
++		uint32_t reserved;
++	}                     mh;
++	static uint8_t        lc[SWEET_LC_MAX_0129];
++	uint64_t              origin[2];
++	uint64_t              keys[3];
++	uint64_t              le_vmaddr = 0, le_fileoff = 0, slide = 0;
++	uint32_t              symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
++	boolean_t             got_st = FALSE, got_le = FALSE;
++	int                   ncand = 0, nkey = 0;
++	uint32_t              i;
++
++	if (e->base == 0 || e->addr <= e->base) {
++		return;
++	}
++	if (copyin((user_addr_t)e->base, &mh, sizeof(mh)) != 0 || mh.magic != 0xfeedfacf ||
++	    mh.ncmds == 0 || mh.ncmds > 512 || mh.sizeofcmds < 8 || mh.sizeofcmds > sizeof(lc)) {
++		return;
++	}
++	if (copyin((user_addr_t)(e->base + sizeof(mh)), lc, mh.sizeofcmds) != 0) {
++		return;
++	}
++	for (i = 0; i + 8 <= mh.sizeofcmds; ) {
++		uint32_t cmd = 0, cs = 0;
++
++		memcpy(&cmd, lc + i, 4);
++		memcpy(&cs, lc + i + 4, 4);
++		if (cs < 8 || i + cs > mh.sizeofcmds) {
++			break;
++		}
++		if (cmd == 0x2 && cs >= 24) {                   /* LC_SYMTAB */
++			memcpy(&symoff, lc + i + 8, 4);
++			memcpy(&nsyms, lc + i + 12, 4);
++			memcpy(&stroff, lc + i + 16, 4);
++			memcpy(&strsize, lc + i + 20, 4);
++			got_st = TRUE;
++		} else if (cmd == 0x19 && cs >= 72) {           /* LC_SEGMENT_64 */
++			if (memcmp(lc + i + 8, "__LINKEDIT", 10) == 0) {
++				memcpy(&le_vmaddr, lc + i + 24, 8);
++				memcpy(&le_fileoff, lc + i + 40, 8);
++				got_le = TRUE;
++			}
++		}
++		i += cs;
++	}
++	if (!got_st || nsyms == 0 || nsyms > (1u << 20) || strsize < 4) {
++		return;
++	}
++
++	if (got_le) {
++		origin[ncand++] = e->base + le_vmaddr - le_fileoff;
++	}
++	origin[ncand++] = e->base;
++
++	{
++		vm_shared_region_t sr = vm_shared_region_get(current_task());
++
++		if (sr != NULL) {
++			slide = sr->sr_slide;
++			vm_shared_region_deallocate(sr);
++		}
++	}
++
++	keys[nkey++] = e->addr - e->base;       /* n_value image relative */
++	keys[nkey++] = e->addr;                 /* n_value slid address   */
++	if (slide != 0) {
++		keys[nkey++] = e->addr - slide; /* n_value unslid address */
++	}
++
++	for (int c = 0; c < ncand; c++) {
++		uint64_t tab = origin[c] + symoff;
++		uint64_t str = origin[c] + stroff;
++
++		for (int k = 0; k < nkey; k++) {
++			char     sym[64];
++			uint64_t delta = 0;
++
++			if (sweet_sym_find_0129(tab, nsyms, str, strsize, keys[k], sym, sizeof(sym), &delta)) {
++				printf("0129 SYM %s %.30s+0x%llx\n", e->tag, sym, delta);
++				return;
++			}
++		}
++	}
++}
++
++static void
++sweet_img_all_0129(thread_t thread)
++{
++	arm_saved_state_t *ss = find_user_regs(thread);
++	static const char *tags[6] = { "b0", "b1", "b2", "b3", "b4", "b5" };
++	uint64_t           fp;
++
++	if (ss == NULL || !is_saved_state64(ss)) {
++		return;
++	}
++	sweet_img_gather_0129(get_saved_state_pc(ss), "pc");
++	sweet_img_gather_0129(get_saved_state_lr(ss), "lr");
++	fp = get_saved_state_fp(ss);
++	for (int i = 0; i < 6 && fp != 0 && (fp & 7) == 0; i++) {
++		uint64_t frame[2];
++
++		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
++			break;
++		}
++		sweet_img_gather_0129(frame[1], tags[i]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	if (sweet_img_n_0129 == 0) {
++		return;
++	}
++	sweet_img_resolve_0129();
++	if (sweet_img_n_0129 > 0) {
++		sweet_sym_0129(0);
++	}
++	if (sweet_img_n_0129 > 1) {
++		sweet_sym_0129(1);
++	}
++	sweet_img_n_0129 = 0;
++}
++
++/* the guard exception is the only place where we can still see what user space
++ * actually asked for: x0..x5 are mach_msg's own arguments and x0 points at the
++ * outgoing message header */
++static void
++sweet_guard_0129(thread_t thread, uint64_t c0)
++{
++	uint32_t           type   = (uint32_t)((c0 >> 61) & 0x7u);
++	uint32_t           flavor = (uint32_t)((c0 >> 32) & 0x1fffffffu);
++	uint32_t           name   = (uint32_t)(c0 & 0xffffffffu);
++	arm_saved_state_t *ss     = find_user_regs(thread);
++	ipc_space_t        space;
++	ipc_entry_t        entry = NULL;
++	ipc_entry_table_t  table;
++	uint32_t           cnt = 0;
++	uint64_t           x0 = 0, x1 = 0;
++
++	if (ss != NULL && is_saved_state64(ss)) {
++		x0 = (uint64_t)saved_state64(ss)->x[0];
++		x1 = (uint64_t)saved_state64(ss)->x[1];
++		printf("0129 X %llx %llx %llx %llx %llx %llx\n", x0, x1,
++		    (uint64_t)saved_state64(ss)->x[2], (uint64_t)saved_state64(ss)->x[3],
++		    (uint64_t)saved_state64(ss)->x[4], (uint64_t)saved_state64(ss)->x[5]);
++		if ((x1 & MACH_SEND_MSG) != 0 && x0 != 0) {
++			mach_msg_header_t h;
++
++			if (copyin((user_addr_t)x0, &h, sizeof(h)) == 0) {
++				printf("0129 MSG b 0x%x sz 0x%x r 0x%x l 0x%x v 0x%x id 0x%x\n",
++				    h.msgh_bits, h.msgh_size, h.msgh_remote_port,
++				    h.msgh_local_port, h.msgh_voucher_port, h.msgh_id);
++			}
++		}
++	}
++	if (type != GUARD_TYPE_MACH_PORT || flavor == 0) {
++		return;
++	}
++	space = current_space();
++	if (space == IS_NULL || !is_active(space)) {
++		printf("0129 GN 0x%x fl 0x%x no space\n", name, flavor);
++		return;
++	}
++	table = is_active_table(space);
++	cnt = (uint32_t)ipc_entry_table_count(table);
++	if (name < cnt) {
++		entry = ipc_entry_table_get(table, name);
++	}
++	printf("0129 GN 0x%x fl 0x%x cnt 0x%x free 0x%x e%d b 0x%x\n", name, flavor, cnt,
++	    (uint32_t)space->is_table_free, entry != NULL,
++	    entry != NULL ? (uint32_t)entry->ie_bits : 0u);
++}
++
+ void
+ sweet_crash_exception_0127(thread_t thread, exception_type_t exception,
+     mach_exception_data_t code, mach_msg_type_number_t codeCnt)
+@@ -1156,6 +1592,14 @@
+ 
+ 	sweet_crash_dump_0127(thread, "exc", (int)exception,
+ 	    codeCnt > 0 ? (uint64_t)code[0] : 0, codeCnt > 1 ? (uint64_t)code[1] : 0);
++
++	/* SWEET 0129: name the code behind the PC, and for a guard also dump the
++	 * mach_msg arguments + message header + our port name table state. */
++	if (exception == EXC_BREAKPOINT) {
++		sweet_img_all_0129(thread);
++	} else if (exception == EXC_GUARD) {
++		sweet_guard_0129(thread, codeCnt > 0 ? (uint64_t)code[0] : 0);
++	}
+ }
+ 
+ void
