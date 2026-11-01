@@ -1,0 +1,125 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 15319a6..b258d34 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1076,6 +1076,9 @@ bsd_init(void)
+ #endif /* DEVELOPMENT || DEBUG */
+ 
+ 	bsd_init_kprintf("done\n");
++
++	/* SWEET 0128: positive proof that this kernel image actually booted. */
++	printf("SWEET 0128 probes armed\n");
+ }
+ 
+ void
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index fde499c..3f95bc3 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1474,6 +1474,29 @@ exit_with_reason(proc_t p, int rv, int *retval, boolean_t thread_can_terminate,
+ 	int error = 0;
+ 	bool proc_exiting = false;
+ 
++	/*
++	 * SWEET 0128: how is pid 1 being terminated?  The caller PC names the
++	 * kernel path that did it and the dump shows where the victim stopped.
++	 */
++	if (p == initproc) {
++		extern void sweet_crash_dump_user_0128(thread_t, const char *);
++		struct uthread *ut0 = (current_proc() == p) ?
++		    (struct uthread *)get_bsdthread_info(self) : NULL;
++		struct os_reason *ur = (ut0 != NULL) ? ut0->uu_exit_reason : NULL;
++
++		printf("SIGTX exit rv 0x%x ra 0x%llx reason 0x%llx ns %d code 0x%llx utr 0x%llx utns %d utcode 0x%llx\n",
++		    rv, (uint64_t)(uintptr_t)__builtin_return_address(0),
++		    (uint64_t)(uintptr_t)exit_reason,
++		    (exit_reason != OS_REASON_NULL) ? exit_reason->osr_namespace : -1,
++		    (exit_reason != OS_REASON_NULL) ? exit_reason->osr_code : 0,
++		    (uint64_t)(uintptr_t)ur,
++		    (ur != NULL) ? ur->osr_namespace : -1,
++		    (ur != NULL) ? ur->osr_code : 0);
++		if (current_proc() == p) {
++			sweet_crash_dump_user_0128(self, "exit");
++		}
++	}
++
+ #if DEVELOPMENT || DEBUG
+ 	/*
+ 	 * Debug boot-arg: panic here if matching process is exiting with non-zero code.
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+index fb9fedd..dc4bed7 100644
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -1786,6 +1786,19 @@ threadsignal(thread_t sig_actthread, int signum, mach_exception_code_t code, boo
+ 	sig_task = get_threadtask(sig_actthread);
+ 	p = (proc_t)(get_bsdtask_info(sig_task));
+ 
++	/*
++	 * SWEET 0128: log the sender and the victim state whenever a signal is
++	 * aimed at pid 1 (the ux_handler path lands here).
++	 */
++	if (p == initproc) {
++		extern void sweet_crash_dump_user_0128(thread_t, const char *);
++
++		printf("SIGTX tsig sig %d code 0x%llx set %d ra 0x%llx\n", signum,
++		    (uint64_t)code, (int)set_exitreason,
++		    (uint64_t)(uintptr_t)__builtin_return_address(0));
++		sweet_crash_dump_user_0128(sig_actthread, "tsig");
++	}
++
+ 	uth = get_bsdthread_info(sig_actthread);
+ 
+ 	proc_lock(p);
+@@ -2058,6 +2071,13 @@ psignal_internal(proc_t p, task_t task, thread_t thread, int flavor, int signum,
+ 	}
+ #endif /* SIGNAL_DEBUG */
+ 
++	/* SWEET 0128: any signal aimed at pid 1, whichever path posted it. */
++	if (p != PROC_NULL && p == initproc) {
++		printf("SIGTX psig sig %d flavor %d ra 0x%llx reason 0x%llx\n", signum, flavor,
++		    (uint64_t)(uintptr_t)__builtin_return_address(0),
++		    (uint64_t)(uintptr_t)signal_reason);
++	}
++
+ 	/* catch unexpected initproc kills early for easier debuggging */
+ 	if (signum == SIGKILL && p == initproc) {
+ 		if (signal_reason == NULL) {
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 6b3c5ee..f325d2e 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -652,6 +652,20 @@ exception_triage_thread(
+ 
+ 	assert(exception != EXC_RPC_ALERT);
+ 
++	{
++		/*
++		 * SWEET 0128: user exceptions are turned into BSD signals by the
++		 * kernel ux_handler (catch_mach_exception_raise ->
++		 * handle_ux_exception -> threadsignal), so bsd_exception() is
++		 * never reached on that path.  Capture pid 1 here instead.
++		 */
++		extern void sweet_crash_exception_0127(thread_t, exception_type_t,
++		    mach_exception_data_t, mach_msg_type_number_t);
++
++		sweet_crash_exception_0127(thread, exception, code, codeCnt);
++	}
++
++
+ 	/*
+ 	 * If this behavior has been requested by the the kernel
+ 	 * (due to the boot environment), we should panic if we
+@@ -1111,6 +1125,13 @@ sweet_crash_dump_0127(thread_t thread, const char *kind, int what, uint64_t c0,
+ 	}
+ }
+ 
++/* SWEET 0128: dump a thread's user state from any straggling pid-1 kill path. */
++void
++sweet_crash_dump_user_0128(thread_t thread, const char *kind)
++{
++	sweet_crash_dump_0127(thread, kind, 0, 0, 0);
++}
++
+ void
+ sweet_crash_exception_0127(thread_t thread, exception_type_t exception,
+     mach_exception_data_t code, mach_msg_type_number_t codeCnt)
