@@ -1,0 +1,100 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -993,6 +993,34 @@
+ 		if (mr != MACH_MSG_SUCCESS) {
+ 			return mr;
+ 		}
++		/* SWEET 0132: record the sender's user PC for every send, and flag
++		 * the ones whose header names a port the kernel can never have
++		 * handed out.  0131 proved that no space ever grew past 32 entries
++		 * and the highest name index ever minted was 5, so a header naming
++		 * index >= 64 was fabricated in userspace -- 0xfb1ea (index 4017)
++		 * is one of those.  pc then points at the code that built it, and
++		 * the kind-1/kind-10 hooks give the callers that asked for a reply
++		 * port to compare against. */
++		{
++			extern void sweet_bb0130(uint32_t, uint64_t, uint64_t,
++			    uint64_t, uint64_t, uint64_t);
++			mach_port_name_t l = user_header.msgh_local_port;
++			mach_port_name_t r = user_header.msgh_remote_port;
++			arm_saved_state_t *ss = get_user_regs(current_thread());
++			uint64_t pc = 0;
++
++			if (ss != NULL && is_saved_state64(ss)) {
++				pc = saved_state64(ss)->pc;
++			}
++			sweet_bb0130(11, pc, (uint64_t)user_header.msgh_bits,
++			    (uint64_t)l, (uint64_t)r, (uint64_t)user_header.msgh_id);
++			if ((l >= 0x4000 && l != MACH_PORT_DEAD) ||
++			    (r >= 0x4000 && r != MACH_PORT_DEAD)) {
++				sweet_bb0130(9, pc, (uint64_t)user_header.msgh_bits,
++				    (uint64_t)l, (uint64_t)r,
++				    (uint64_t)user_header.msgh_id);
++			}
++		}
+ 	}
+ 
+ 	if (option32 & MACH_SEND_MSG) {
+--- a/osfmk/kern/ipc_tt.c
++++ b/osfmk/kern/ipc_tt.c
+@@ -1433,6 +1433,20 @@
+ 		sweet_bb0130(1, (uint64_t)name, (uint64_t)kr,
+ 		    (uint64_t)current_space(), (uint64_t)port, 0);
+ 	}
++	/* SWEET 0132: and record which user PC asked for it, so it can be held
++	 * against the PC that later sends a message naming a different, bogus
++	 * reply port. */
++	{
++		extern void sweet_bb0130(uint32_t, uint64_t, uint64_t, uint64_t,
++		    uint64_t, uint64_t);
++		arm_saved_state_t *ss = get_user_regs(current_thread());
++		uint64_t pc = 0;
++
++		if (ss != NULL && is_saved_state64(ss)) {
++			pc = saved_state64(ss)->pc;
++		}
++		sweet_bb0130(10, pc, (uint64_t)name, 0, 0, 0);
++	}
+ 	return name;
+ }
+ 
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1217,6 +1217,37 @@
+ 		printf("0130 E%u t 0x%llx %llx %llx %llx %llx\n", p->k, p->t,
+ 		    p->a, p->b, p->c, p->d);
+ 	}
++
++	/* SWEET 0132: user PCs.  k == 10 is a send whose header named an
++	 * impossible port (the smoking gun), k == 11 a reply port allocation
++	 * site, k == 12 every send (so the last few can be replayed). */
++	{
++		uint32_t seen11 = 0, skip11;
++
++		for (i = start; i < sweet_bb0130_n; i++) {
++			if (sweet_bb0130_ring[i % SWEET_BB0130_RING].k == 12) {
++				seen11++;
++			}
++		}
++		skip11 = (seen11 > 8) ? (seen11 - 8) : 0;
++		for (i = start; i < sweet_bb0130_n; i++) {
++			struct sweet_bb0130_ent *p = &sweet_bb0130_ring[i % SWEET_BB0130_RING];
++
++			if (p->k == 10) {
++				printf("0132 GHOST pc 0x%llx b 0x%llx l 0x%llx r 0x%llx id 0x%llx\n",
++				    p->a, p->b, p->c, p->d, p->e);
++			} else if (p->k == 11) {
++				printf("0132 RPLY pc 0x%llx nm 0x%llx\n", p->a, p->b);
++			} else if (p->k == 12) {
++				if (skip11 > 0) {
++					skip11--;
++				} else {
++					printf("0132 SEND pc 0x%llx b 0x%llx l 0x%llx r 0x%llx id 0x%llx\n",
++					    p->a, p->b, p->c, p->d, p->e);
++				}
++			}
++		}
++	}
+ }
+ 
+ /* ---------------------------------------------------------------------------
