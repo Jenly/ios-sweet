@@ -1,0 +1,266 @@
+diff --git a/osfmk/ipc/ipc_entry.c b/osfmk/ipc/ipc_entry.c
+index 4a44c50..a607e45 100644
+--- a/osfmk/ipc/ipc_entry.c
++++ b/osfmk/ipc/ipc_entry.c
+@@ -245,6 +245,11 @@ ipc_entry_claim(
+ 	 */
+ 	new_name = MACH_PORT_MAKE(first_free, gen);
+ 	assert(MACH_PORT_VALID(new_name));
++	/* SWEET 0131: every dynamically issued name passes through here */
++	{
++		extern void sweet_bb0131_name(mach_port_name_t, uint64_t);
++		sweet_bb0131_name(new_name, (uint64_t)space);
++	}
+ 	*namep = new_name;
+ 	*entryp = entry;
+ 
+@@ -631,6 +636,12 @@ ipc_entry_grow_table(
+ 	 * bump this downward, and we only have to reprocess entries
+ 	 * above that mark.  Eventually, we'll get done.
+ 	 */
++	/* SWEET 0131: did this space's name table ever grow past its initial size? */
++	{
++		extern void sweet_bb0131_grow(uint64_t, uint32_t, uint32_t);
++		sweet_bb0131_grow((uint64_t)space, (uint32_t)ocount,
++		    (uint32_t)ipc_entry_table_size_to_count(nsize));
++	}
+ 	ipc_space_start_growing(space);
+ 	space->is_low_mod = ocount;
+ 	space->is_high_mod = 0;
+diff --git a/osfmk/ipc/mach_port.c b/osfmk/ipc/mach_port.c
+index d47140b..59c99d6 100644
+--- a/osfmk/ipc/mach_port.c
++++ b/osfmk/ipc/mach_port.c
+@@ -897,6 +897,14 @@ mach_port_mod_refs(
+ 
+ 	kr = ipc_right_lookup_write(space, name, &entry);
+ 	if (kr != KERN_SUCCESS) {
++		/* SWEET 0131: real arguments of the failing mod_refs (0130 only had
++		 * the polluted exception frame). kind 1 = mach_port_mod_refs. */
++		{
++			extern void sweet_bb0131_ref(uint32_t, uint32_t, uint64_t,
++			    int32_t, int32_t, int32_t);
++			sweet_bb0131_ref(1, (uint32_t)name, (uint64_t)space,
++			    (int32_t)right, (int32_t)delta, (int32_t)kr);
++		}
+ 		mach_port_guard_exception(name, 0, 0, kGUARD_EXC_INVALID_NAME);
+ 		return kr;
+ 	}
+@@ -1442,6 +1450,13 @@ mach_port_move_member(
+ 
+ 	waitq_link_free_list(WQT_PORT_SET, &free_l);
+ done:
++	/* SWEET 0131: real arguments of the failing move_member. kind 2. */
++	{
++		extern void sweet_bb0131_ref(uint32_t, uint32_t, uint64_t,
++		    int32_t, int32_t, int32_t);
++		sweet_bb0131_ref(2, (uint32_t)member, (uint64_t)space,
++		    (int32_t)after, 0, (int32_t)kr);
++	}
+ 	if (link.wqlh) {
+ 		waitq_link_free(WQT_PORT_SET, link);
+ 	}
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index cdd447a..5655f09 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1090,7 +1090,7 @@ void sweet_bb0130_dump(const char *why);
+ 
+ #define SWEET_BB0130_RING   128
+ #define SWEET_BB0130_KINDS  12
+-#define SWEET_BB0130_DUMP   10
++#define SWEET_BB0130_DUMP   5
+ 
+ struct sweet_bb0130_ent {
+ 	uint64_t t;                                     /* recording task */
+@@ -1219,6 +1219,182 @@ sweet_bb0130_dump(const char *why)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * SWEET 0131: trace the ghost reply-port name (0xfb1ea -> index 4017) that
++ * 0130 caught in pid 1's failing host_info() message.
++ *
++ * 0130 established that only the reply port name is wrong: the destination
++ * (503 = the host port), the msgh_id (0xc8 = host_info) and the kernel-side MIG
++ * service all check out, and pid 1's name table holds only 6 names (indices
++ * 3/4/5) out of its initial 32 entries.  Three questions remain:
++ *
++ *   1. was 0xfb1ea ever issued to *any* space?  ipc_entry_claim() is the single
++ *      choke point for dynamically issued names: watch it, remember the highest
++ *      name index ever issued anywhere, and count exact hits on the ghost name;
++ *   2. did pid 1's name table ever grow beyond its initial 32 entries?  If not,
++ *      index 4017 could never have been addressable in that space at all;
++ *   3. what were the *real* arguments of the failing mach_port_mod_refs() /
++ *      mach_port_move_member() calls, instead of the polluted exception frame?
++ *
++ * The verdict line (0131 KEY) is printed last, so it survives in the console
++ * ring even if the dump overruns the ring.
++ * ------------------------------------------------------------------------ */
++
++#define SWEET_GHOST_NAME    0xfb1ea     /* reply_name seen in the 0130 dump */
++#define SWEET_BB0131_BIG    64          /* record issued names with index >= this */
++#define SWEET_BB0131_NAMES  16
++#define SWEET_BB0131_GROWS  8
++#define SWEET_BB0131_REFS   16
++#define SWEET_BB0131_SHOW   2           /* ring entries printed at dump time */
++
++void sweet_bb0131_name(mach_port_name_t nm, uint64_t sp);
++void sweet_bb0131_grow(uint64_t sp, uint32_t old_count, uint32_t new_count);
++void sweet_bb0131_ref(uint32_t kind, uint32_t nm, uint64_t sp, int32_t a,
++    int32_t b, int32_t kr);
++void sweet_bb0131_dump(const char *why);
++
++struct sweet_bb0131_nm { uint64_t sp; uint32_t nm; uint32_t idx; };
++struct sweet_bb0131_gr { uint64_t sp; uint32_t oldc; uint32_t newc; };
++struct sweet_bb0131_rf {
++	uint64_t sp;
++	uint32_t nm;
++	int32_t kind;
++	int32_t a;
++	int32_t b;
++	int32_t kr;
++};
++
++static struct sweet_bb0131_nm sweet_bb0131_nms[SWEET_BB0131_NAMES];
++static struct sweet_bb0131_gr sweet_bb0131_grs[SWEET_BB0131_GROWS];
++static struct sweet_bb0131_rf sweet_bb0131_rfs[SWEET_BB0131_REFS];
++static uint32_t sweet_bb0131_nnm, sweet_bb0131_ngr, sweet_bb0131_nrf;
++static uint32_t sweet_bb0131_maxidx, sweet_bb0131_maxnm;
++static uint64_t sweet_bb0131_maxsp;
++static uint32_t sweet_bb0131_ghost;
++
++/* every dynamically issued name in the kernel passes through ipc_entry_claim() */
++void
++sweet_bb0131_name(mach_port_name_t nm, uint64_t sp)
++{
++	uint32_t idx = (uint32_t)MACH_PORT_INDEX(nm);
++	struct sweet_bb0131_nm *p;
++
++	if (idx > sweet_bb0131_maxidx) {
++		sweet_bb0131_maxidx = idx;
++		sweet_bb0131_maxnm = (uint32_t)nm;
++		sweet_bb0131_maxsp = sp;
++	}
++	if ((uint32_t)nm == (uint32_t)SWEET_GHOST_NAME) {
++		sweet_bb0131_ghost++;
++	}
++	if (idx < SWEET_BB0131_BIG) {
++		return;
++	}
++	p = &sweet_bb0131_nms[sweet_bb0131_nnm % SWEET_BB0131_NAMES];
++	sweet_bb0131_nnm++;
++	p->sp = sp;
++	p->nm = (uint32_t)nm;
++	p->idx = idx;
++}
++
++/* the name table of a space only ever grows; 32 entries is the initial size */
++void
++sweet_bb0131_grow(uint64_t sp, uint32_t old_count, uint32_t new_count)
++{
++	struct sweet_bb0131_gr *p =
++	    &sweet_bb0131_grs[sweet_bb0131_ngr % SWEET_BB0131_GROWS];
++
++	sweet_bb0131_ngr++;
++	p->sp = sp;
++	p->oldc = old_count;
++	p->newc = new_count;
++}
++
++/* real arguments of the port-right calls that fail on a name */
++void
++sweet_bb0131_ref(uint32_t kind, uint32_t nm, uint64_t sp, int32_t a, int32_t b,
++    int32_t kr)
++{
++	struct sweet_bb0131_rf *p =
++	    &sweet_bb0131_rfs[sweet_bb0131_nrf % SWEET_BB0131_REFS];
++
++	if (nm == (uint32_t)SWEET_GHOST_NAME) {
++		sweet_bb0131_ghost++;
++	}
++	sweet_bb0131_nrf++;
++	p->sp = sp;
++	p->nm = nm;
++	p->kind = (int32_t)kind;
++	p->a = a;
++	p->b = b;
++	p->kr = kr;
++}
++
++void
++sweet_bb0131_dump(const char *why)
++{
++	task_t t = current_task();
++	ipc_space_t space = (t != TASK_NULL) ? t->itk_space : IS_NULL;
++	uint32_t cap = 0, i, start, show;
++
++	if (space != IS_NULL && is_active(space)) {
++		ipc_entry_table_t table = is_active_table(space);
++
++		cap = (uint32_t)ipc_entry_table_count(table);
++		printf("0131 TE cap %u\n", cap);
++		for (i = 1; i < cap; i++) {
++			ipc_entry_t e = ipc_entry_table_get(table, i);
++			mach_port_gen_t gen;
++
++			if (e == IE_NULL || e->ie_object == IO_NULL) {
++				continue;
++			}
++			gen = (mach_port_gen_t)(IE_BITS_GEN(e->ie_bits) >> 24);
++			printf("0131 TI %u nm 0x%x b 0x%x\n", i,
++			    (uint32_t)MACH_PORT_MAKE(i, gen),
++			    (uint32_t)e->ie_bits);
++		}
++	} else {
++		printf("0131 TE sp 0x%llx no space\n", (uint64_t)space);
++	}
++
++	printf("0131 GT n %u\n", sweet_bb0131_ngr);
++	start = (sweet_bb0131_ngr > SWEET_BB0131_GROWS) ?
++	    (sweet_bb0131_ngr - SWEET_BB0131_GROWS) : 0;
++	for (i = start, show = 0;
++	    i < sweet_bb0131_ngr && show < SWEET_BB0131_SHOW; i++, show++) {
++		struct sweet_bb0131_gr *p =
++		    &sweet_bb0131_grs[i % SWEET_BB0131_GROWS];
++		printf("0131 G sp 0x%llx %u to %u\n", p->sp, p->oldc, p->newc);
++	}
++
++	printf("0131 AT n %u\n", sweet_bb0131_nnm);
++	start = (sweet_bb0131_nnm > SWEET_BB0131_NAMES) ?
++	    (sweet_bb0131_nnm - SWEET_BB0131_NAMES) : 0;
++	for (i = start, show = 0;
++	    i < sweet_bb0131_nnm && show < SWEET_BB0131_SHOW; i++, show++) {
++		struct sweet_bb0131_nm *p =
++		    &sweet_bb0131_nms[i % SWEET_BB0131_NAMES];
++		printf("0131 A nm 0x%x idx %u sp 0x%llx\n", p->nm, p->idx, p->sp);
++	}
++
++	printf("0131 RT n %u\n", sweet_bb0131_nrf);
++	start = (sweet_bb0131_nrf > SWEET_BB0131_REFS) ?
++	    (sweet_bb0131_nrf - SWEET_BB0131_REFS) : 0;
++	for (i = start, show = 0;
++	    i < sweet_bb0131_nrf && show < SWEET_BB0131_SHOW; i++, show++) {
++		struct sweet_bb0131_rf *p =
++		    &sweet_bb0131_rfs[i % SWEET_BB0131_REFS];
++		printf("0131 R k %d nm 0x%x a %d b %d kr %d sp 0x%llx\n", p->kind,
++		    p->nm, p->a, p->b, p->kr, p->sp);
++	}
++
++	printf("0131 KEY %s ghost %u maxidx %u maxnm 0x%x maxsp 0x%llx\n", why,
++	    sweet_bb0131_ghost, sweet_bb0131_maxidx, sweet_bb0131_maxnm,
++	    sweet_bb0131_maxsp);
++}
++
++
+ static void
+ sweet_crash_dump_0127(thread_t thread, const char *kind, int what, uint64_t c0, uint64_t c1)
+ {
+@@ -1230,6 +1406,7 @@ sweet_crash_dump_0127(thread_t thread, const char *kind, int what, uint64_t c0,
+ 	/* SWEET 0130: the console ring only keeps the last ~37 lines, so the
+ 	 * black box has to lead the crash dump. */
+ 	sweet_bb0130_dump(kind);
++	sweet_bb0131_dump(kind);	/* SWEET 0131: ghost-name verdict */
+ 
+ 	if (ss == NULL || !is_saved_state64(ss)) {
+ 		printf("CRASHX %s %d no user state\n", kind, what);
