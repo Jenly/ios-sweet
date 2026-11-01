@@ -1,0 +1,40 @@
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1976,6 +1976,37 @@
+ 	 * mach_msg arguments + message header + our port name table state. */
+ 	if (exception == EXC_BREAKPOINT) {
+ 		sweet_img_all_0129(thread);
++		/* SWEET 0134: the invalid_reply hook stored the *user* pc/lr of the
++		 * RPC that tripped the guard.  Symbolicate them the same way 0129
++		 * symbols the crash pc, so the caller in libpthread is printed by
++		 * name (+offset) and not as a raw address.  Printed last on purpose:
++		 * the on-screen console only keeps the final lines. */
++		if (sweet_bb0130_cnt[12] != 0) {
++			uint64_t uipc = 0, uilr = 0;
++			uint32_t ui;
++
++			for (ui = 0; ui < sweet_bb0130_n; ui++) {
++				struct sweet_bb0130_ent *pu =
++				    &sweet_bb0130_ring[ui % SWEET_BB0130_RING];
++
++				if (pu->k == 13) {
++					uipc = pu->a;
++					uilr = pu->b;
++				}
++			}
++			printf("0134 INVRAW pc 0x%llx lr 0x%llx n %u\n", uipc, uilr,
++			    (uint32_t)sweet_bb0130_cnt[12]);
++			sweet_img_gather_0129(uipc, "ipcpc");
++			sweet_img_gather_0129(uilr, "ipclr");
++			sweet_img_resolve_0129();
++			if (sweet_img_n_0129 > 0) {
++				sweet_sym_0129(0);
++			}
++			if (sweet_img_n_0129 > 1) {
++				sweet_sym_0129(1);
++			}
++			sweet_img_n_0129 = 0;
++		}
+ 	} else if (exception == EXC_GUARD) {
+ 		sweet_guard_0129(thread, codeCnt > 0 ? (uint64_t)code[0] : 0);
+ 	}
