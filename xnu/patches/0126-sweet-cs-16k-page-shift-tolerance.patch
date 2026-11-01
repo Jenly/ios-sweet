@@ -1,0 +1,54 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index 9b553be..54cfe2a 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -124,6 +124,11 @@ ZONE_DEFINE_ID(ZONE_ID_CS_BLOB, "cs_blob zone", struct cs_blob,
+ extern int cs_debug;
+ 
+ #define PAGE_SHIFT_4K           (12)
++/* SWEET 0126: real iOS userland is built for 16K-page devices, so the dyld
++ * shared cache carries a 16K CodeDirectory page size.  chiron cannot run 16K
++ * pages (ARMv8.0 / Kryo 280), so signatures like that have to be accepted
++ * here; their pages simply cannot be hash-validated on this kernel. */
++#define PAGE_SHIFT_16K          (14)
+ 
+ static boolean_t
+ cs_valid_range(
+@@ -371,7 +376,17 @@ cs_validate_codedirectory(const CS_CodeDirectory *cd, size_t length)
+ 	if (ntohl(cd->magic) != CSMAGIC_CODEDIRECTORY) {
+ 		return EBADEXEC;
+ 	}
+-	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT)) {
++	/* SWEET 0126: chiron (MSM8998/Kryo 280, ARMv8.0) cannot use the 16K
++	 * translation granule, so this kernel runs with 4K pages while real iOS
++	 * userland is signed for 16K devices.  Individual binaries carry a 4K
++	 * CodeDirectory (accepted below), but the dyld shared cache carries a 16K
++	 * one.  Rejecting it made dyld's F_ADDFILESIGS_RETURN registration on the
++	 * cache fail, so dyld dropped the cache and pid 1 died with "Library not
++	 * loaded: /usr/lib/libSystem.B.dylib ... no dyld cache" (-> panic:
++	 * Initproc failed to start).  Accept it; a blob signed for a page size we
++	 * do not have cannot be hash-validated here, see cs_validate_hash(). */
++	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT) &&
++	    (cd->pageSize != PAGE_SHIFT_16K)) {
+ 		printf("disallowing unsupported code signature page shift: %u\n", cd->pageSize);
+ 		return EBADEXEC;
+ 	}
+@@ -5719,6 +5734,18 @@ cs_validate_hash(
+ 		if (cd != NULL) {
+ 			/* all CD's that have been injected is already validated */
+ 
++			/* SWEET 0126: our pages are 4K, this blob's hashes are 16K
++			 * granular (a real iOS shared cache signature).  We cannot hash
++			 * 16K out of the 4K page we were handed, and the alignment check
++			 * below would panic on 3 of every 4 pages.  Report "no hash"
++			 * instead: bytes_processed stays 0, which cs_validate_page()
++			 * already treats as "this chunk is not code-signed" and skips.
++			 * The page is then left unvalidated and the normal enforcement
++			 * policy decides (cs_enforcement_disable=1 on this port). */
++			if (blob->csb_hash_pageshift != PAGE_SHIFT) {
++				break;
++			}
++
+ 			hashtype = blob->csb_hashtype;
+ 			if (hashtype == NULL) {
+ 				panic("unknown hash type ?");
