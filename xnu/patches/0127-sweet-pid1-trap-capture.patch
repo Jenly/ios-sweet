@@ -1,0 +1,143 @@
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+index ca53f9b..fb9fedd 100644
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -2074,6 +2074,17 @@ psignal_internal(proc_t p, task_t task, thread_t thread, int flavor, int signum,
+ 		}
+ 	}
+ 
++	/*
++	 * SWEET 0127: a fatal signal is being posted to pid 1.  Dump the user
++	 * state here as well: the exit path probe (0043) never printed on the
++	 * phone, and this path also covers raise()/kill() driven deaths.
++	 */
++	if (p == initproc && (prop & (SA_KILL | SA_CORE))) {
++		extern void sweet_crash_signal_0127(int, uint64_t);
++
++		sweet_crash_signal_0127(signum, (uint64_t)signal_reason);
++	}
++
+ 	/*
+ 	 *	We will need the task pointer later.  Grab it now to
+ 	 *	check for a zombie process.  Also don't send signals
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..6b3c5ee 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1042,6 +1042,107 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
++/* SWEET 0127: capture the moment an unhandled exception becomes a signal, and
++ * the moment a fatal signal is posted to pid 1.  0043's probe lives in the exit
++ * path (proc_prepareexit) and never printed on the phone, so this one runs while
++ * the user state is still valid.  Deliberately unguarded -- a guard that is false
++ * in this translation unit is exactly how a probe goes silent.
++ */
++#include <vm/vm_shared_region.h>
++#include <arm/thread.h>
++
++void sweet_crash_signal_0127(int signum, uint64_t reason);
++
++static void
++sweet_crash_dump_0127(thread_t thread, const char *kind, int what, uint64_t c0, uint64_t c1)
++{
++	task_t task = current_task();
++	arm_saved_state_t *ss = find_user_regs(thread);
++	vm_shared_region_t sr;
++	uint64_t slide = 0;
++
++	if (ss == NULL || !is_saved_state64(ss)) {
++		printf("CRASHX %s %d no user state\n", kind, what);
++		return;
++	}
++
++	sr = vm_shared_region_get(task);
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++		vm_shared_region_deallocate(sr);
++	}
++
++	printf("CRASHX %s %d c 0x%llx 0x%llx slide 0x%llx mh 0x%llx\n", kind, what, c0, c1,
++	    slide, (uint64_t)task->mach_header_vm_address);
++	printf("CRASHX pc 0x%llx lr 0x%llx sp 0x%llx fp 0x%llx far 0x%llx\n",
++	    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss),
++	    get_saved_state_fp(ss), (uint64_t)saved_state64(ss)->far);
++
++	{
++		uint32_t insn[5];
++
++		if (copyin((user_addr_t)(get_saved_state_pc(ss) - 4), insn, sizeof(insn)) == 0) {
++			printf("CRASHX insn %08x %08x %08x %08x %08x\n",
++			    insn[0], insn[1], insn[2], insn[3], insn[4]);
++		} else {
++			printf("CRASHX insn unreadable\n");
++		}
++	}
++
++	{
++		uint64_t fp = get_saved_state_fp(ss);
++		char line[220];
++		int n = snprintf(line, sizeof(line), "CRASHX bt 0x%llx 0x%llx",
++		    get_saved_state_pc(ss), get_saved_state_lr(ss));
++
++		for (int i = 0; i < 8 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++			uint64_t frame[2];
++
++			if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
++				break;
++			}
++			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++			if (frame[0] <= fp) {
++				break;
++			}
++			fp = frame[0];
++		}
++		printf("%s\n", line);
++	}
++}
++
++void
++sweet_crash_exception_0127(thread_t thread, exception_type_t exception,
++    mach_exception_data_t code, mach_msg_type_number_t codeCnt)
++{
++	task_t task = current_task();
++	proc_t p = get_bsdtask_info(task);
++
++	if (p == NULL || proc_pid(p) != 1) {
++		return;
++	}
++
++	switch (exception) {
++	case EXC_BREAKPOINT:
++	case EXC_BAD_ACCESS:
++	case EXC_BAD_INSTRUCTION:
++	case EXC_ARITHMETIC:
++	case EXC_GUARD:
++		break;
++	default:
++		return;
++	}
++
++	sweet_crash_dump_0127(thread, "exc", (int)exception,
++	    codeCnt > 0 ? (uint64_t)code[0] : 0, codeCnt > 1 ? (uint64_t)code[1] : 0);
++}
++
++void
++sweet_crash_signal_0127(int signum, uint64_t reason)
++{
++	sweet_crash_dump_0127(current_thread(), "sig", signum, reason, 0);
++}
++
+ kern_return_t
+ bsd_exception(
+ 	exception_type_t        exception,
+@@ -1053,6 +1154,8 @@ bsd_exception(
+ 	thread_t                self = current_thread();
+ 	kern_return_t           kr;
+ 
++	sweet_crash_exception_0127(self, exception, code, codeCnt);
++
+ 	/*
+ 	 * Maybe the task level will handle it.
+ 	 */
