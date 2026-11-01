@@ -1,0 +1,156 @@
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1089,7 +1089,7 @@
+ void sweet_bb0130_dump(const char *why);
+ 
+ #define SWEET_BB0130_RING   128
+-#define SWEET_BB0130_KINDS  12
++#define SWEET_BB0130_KINDS  16
+ #define SWEET_BB0130_DUMP   5
+ 
+ struct sweet_bb0130_ent {
+@@ -1171,7 +1171,7 @@
+ 	}
+ 
+ 	printf("0130 HDR %s n %u cnt", why, sweet_bb0130_n);
+-	for (i = 1; i < SWEET_BB0130_KINDS; i++) {
++	for (i = 1; i < 13; i++) {
+ 		printf(" %u", sweet_bb0130_cnt[i]);
+ 	}
+ 	printf("\n");
+@@ -1218,33 +1218,41 @@
+ 		    p->a, p->b, p->c, p->d);
+ 	}
+ 
+-	/* SWEET 0132: user PCs.  k == 10 is a send whose header named an
+-	 * impossible port (the smoking gun), k == 11 a reply port allocation
+-	 * site, k == 12 every send (so the last few can be replayed). */
++	/* SWEET 0132/0133: user PCs.  At trap entry pc sits inside the
++	 * libsystem_kernel svc stub, so lr is the value that names the caller.
++	 *   k == 10  send whose header named an impossible port (smoking gun)
++	 *   k == 11  reply port allocation site
++	 *   k == 12  every send seen on legacy mach_msg_overwrite_ (trap 32)
++	 *   k == 13  invalid_reply in ipc_kmsg_copyin_header -- shared by trap
++	 *            32 and trap 47, so this one always fires */
+ 	{
+-		uint32_t seen11 = 0, skip11;
++		uint32_t seen12 = 0, skip12;
+ 
+ 		for (i = start; i < sweet_bb0130_n; i++) {
+ 			if (sweet_bb0130_ring[i % SWEET_BB0130_RING].k == 12) {
+-				seen11++;
++				seen12++;
+ 			}
+ 		}
+-		skip11 = (seen11 > 8) ? (seen11 - 8) : 0;
++		skip12 = (seen12 > 8) ? (seen12 - 8) : 0;
+ 		for (i = start; i < sweet_bb0130_n; i++) {
+ 			struct sweet_bb0130_ent *p = &sweet_bb0130_ring[i % SWEET_BB0130_RING];
+ 
+ 			if (p->k == 10) {
+-				printf("0132 GHOST pc 0x%llx b 0x%llx l 0x%llx r 0x%llx id 0x%llx\n",
++				printf("0132 GHOST pc 0x%llx lr 0x%llx b 0x%llx l 0x%llx id 0x%llx\n",
+ 				    p->a, p->b, p->c, p->d, p->e);
+ 			} else if (p->k == 11) {
+-				printf("0132 RPLY pc 0x%llx nm 0x%llx\n", p->a, p->b);
++				printf("0133 RPLY pc 0x%llx lr 0x%llx nm 0x%llx\n",
++				    p->a, p->b, p->c);
+ 			} else if (p->k == 12) {
+-				if (skip11 > 0) {
+-					skip11--;
++				if (skip12 > 0) {
++					skip12--;
+ 				} else {
+-					printf("0132 SEND pc 0x%llx b 0x%llx l 0x%llx r 0x%llx id 0x%llx\n",
++					printf("0133 SEND pc 0x%llx lr 0x%llx b 0x%llx l 0x%llx id 0x%llx\n",
+ 					    p->a, p->b, p->c, p->d, p->e);
+ 				}
++			} else if (p->k == 13) {
++				printf("0133 INV pc 0x%llx lr 0x%llx rep 0x%llx dst 0x%llx id 0x%llx\n",
++				    p->a, p->b, p->c, p->d, p->e);
+ 			}
+ 		}
+ 	}
+--- a/osfmk/kern/ipc_tt.c
++++ b/osfmk/kern/ipc_tt.c
+@@ -1433,19 +1433,22 @@
+ 		sweet_bb0130(1, (uint64_t)name, (uint64_t)kr,
+ 		    (uint64_t)current_space(), (uint64_t)port, 0);
+ 	}
+-	/* SWEET 0132: and record which user PC asked for it, so it can be held
+-	 * against the PC that later sends a message naming a different, bogus
+-	 * reply port. */
++	/* SWEET 0132/0133: and record which user PC asked for it, so it can be
++	 * held against the PC that later sends a message naming a different,
++	 * bogus reply port.  At trap entry pc sits inside the libsystem_kernel
++	 * svc stub, so lr -- the stub's own return address -- is the value that
++	 * actually names the caller in libpthread. */
+ 	{
+ 		extern void sweet_bb0130(uint32_t, uint64_t, uint64_t, uint64_t,
+ 		    uint64_t, uint64_t);
+ 		arm_saved_state_t *ss = get_user_regs(current_thread());
+-		uint64_t pc = 0;
++		uint64_t pc = 0, lr = 0;
+ 
+ 		if (ss != NULL && is_saved_state64(ss)) {
+ 			pc = saved_state64(ss)->pc;
++			lr = saved_state64(ss)->lr;
+ 		}
+-		sweet_bb0130(10, pc, (uint64_t)name, 0, 0, 0);
++		sweet_bb0130(10, pc, lr, (uint64_t)name, 0, 0);
+ 	}
+ 	return name;
+ }
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -1007,18 +1007,18 @@
+ 			mach_port_name_t l = user_header.msgh_local_port;
+ 			mach_port_name_t r = user_header.msgh_remote_port;
+ 			arm_saved_state_t *ss = get_user_regs(current_thread());
+-			uint64_t pc = 0;
++			uint64_t pc = 0, lr = 0;
+ 
+ 			if (ss != NULL && is_saved_state64(ss)) {
+ 				pc = saved_state64(ss)->pc;
++				lr = saved_state64(ss)->lr;
+ 			}
+-			sweet_bb0130(11, pc, (uint64_t)user_header.msgh_bits,
+-			    (uint64_t)l, (uint64_t)r, (uint64_t)user_header.msgh_id);
++			sweet_bb0130(11, pc, lr, (uint64_t)user_header.msgh_bits,
++			    (uint64_t)l, (uint64_t)user_header.msgh_id);
+ 			if ((l >= 0x4000 && l != MACH_PORT_DEAD) ||
+ 			    (r >= 0x4000 && r != MACH_PORT_DEAD)) {
+-				sweet_bb0130(9, pc, (uint64_t)user_header.msgh_bits,
+-				    (uint64_t)l, (uint64_t)r,
+-				    (uint64_t)user_header.msgh_id);
++				sweet_bb0130(9, pc, lr, (uint64_t)user_header.msgh_bits,
++				    (uint64_t)l, (uint64_t)user_header.msgh_id);
+ 			}
+ 		}
+ 	}
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -4331,6 +4331,23 @@
+ 		    (uint64_t)reply_type);
+ 		sweet_bb0130_q(10, reply_name);
+ 	}
++	/* SWEET 0133: this label is reached from whichever send trap the caller
++	 * used -- legacy mach_msg_overwrite_ (trap 32) or mach_msg2 (trap 47) --
++	 * so unlike a hook on either trap body, it is guaranteed to fire for the
++	 * offending RPC.  Record the user pc/lr here to name the caller. */
++	{
++		extern void sweet_bb0130(uint32_t, uint64_t, uint64_t, uint64_t,
++		    uint64_t, uint64_t);
++		arm_saved_state_t *ss = get_user_regs(current_thread());
++		uint64_t pc = 0, lr = 0;
++
++		if (ss != NULL && is_saved_state64(ss)) {
++			pc = saved_state64(ss)->pc;
++			lr = saved_state64(ss)->lr;
++		}
++		sweet_bb0130(12, pc, lr, (uint64_t)reply_name,
++		    (uint64_t)dest_name, (uint64_t)msg->msgh_id);
++	}
+ 	is_write_unlock(space);
+ 
+ 	if (release_port != IP_NULL) {
